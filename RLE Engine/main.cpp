@@ -6,45 +6,37 @@
 #include <limits>
 
 //~~@ use memory mapped files instead of file streams
-//~~@ templatize node-accepting functions
-//~~@ RLE(X) header value, where X is node type (high nibble offset byte ct, low nibble length byte ct)
-//~~_ get some better test files
-//~~_ build a test harness
-//~~@ modify struct Run to use span instead of position
-//~~~ check compiler implementations to ensure that packed is behaving properly and that vector is treating it right
+//~~_ RLE(X) header value, where X is node type (high nibble prefix byte ct, low nibble length byte ct)
+//~~_ modify inflate routine to use the header for determining node type
+//~~_ get a nice set of various test files going
+//~~_ implement system to determine most efficient node type based on runs vector
+//~~_ modify deflate routine to select and use most efficient node type
+//~~~ check compiler implementations to ensure that pack pragma behaves properly and that vector is treating it right (no filler between elements, etc)
 
 using byte = uint8_t;
 
-template <typename OffsetT, typename LengthT>
+template <typename PrefixT, typename LengthT>
 struct BaseRLENode {
-  using OffsetType = OffsetT;
-  static constexpr size_t OffsetMax = std::numeric_limits<OffsetType>::max();
+  using PrefixType = PrefixT;
+  static constexpr size_t PrefixMax = std::numeric_limits<PrefixType>::max();
   using LengthType = LengthT;
   static constexpr size_t LengthMax = std::numeric_limits<LengthType>::max();
 
-  OffsetType prefix; //offset from previous node's tail
+  PrefixType prefix; //offset from previous node's tail
   LengthType length;
   byte value;
 };
 
-using RLENode = BaseRLENode<uint32_t, uint32_t>;
-
 #pragma pack(push, 1)
-template <typename OffsetT, typename LengthT>
+template <typename PrefixT, typename LengthT>
 struct BasePackedRLENode {
-  OffsetT prefix;
+  PrefixT prefix;
   LengthT length;
   byte value;
 };
 #pragma pack(pop)
 
-using PackedRLENode = BasePackedRLENode<RLENode::OffsetType, RLENode::LengthType>;
-
-struct Run {
-  size_t position;
-  size_t length;
-  byte value;
-};
+using Run = BaseRLENode<size_t, size_t>;
 
 template<class T>
 constexpr size_t bitsizeof() {
@@ -62,18 +54,15 @@ std::vector<byte> loadFile(const std::string& filename) {
   return data;
 }
 
+template <class PackedNodeType>
 std::vector<Run> collectRuns(const std::vector<byte>& data) {
   std::vector<Run> runs;
   runs.reserve(100);
 
-  bool reuse = false;
+  Run run;
+  size_t prevTailPos = 0;
   for(size_t i = 0; i < data.size(); ) {
-    if(!reuse) {
-      runs.emplace_back();
-    }
-
-    auto& run = runs.back();
-    run.position = i;
+    auto position = i;
     run.length = 1;
     run.value = data[i];
 
@@ -81,88 +70,89 @@ std::vector<Run> collectRuns(const std::vector<byte>& data) {
       run.length++;
     }
 
-    reuse = (run.length <= sizeof(PackedRLENode));
-  }
-
-  if(reuse) {
-    runs.pop_back();
+    if(run.length > sizeof(PackedNodeType)) {
+      run.prefix = position - prevTailPos;
+      runs.push_back(run);
+      prevTailPos = position + run.length;
+    }
   }
 
   return runs;
 }
 
-constexpr size_t lengthFromPair(RLENode::OffsetType offset, RLENode::LengthType length) {
-  size_t retval = offset;
-  retval <<= bitsizeof<RLENode::LengthType>();
-  retval += length;
+template <class NodeType>
+constexpr size_t lengthFromLongNode(const NodeType& node) {
+  size_t retval = node.prefix;
+  retval <<= bitsizeof<NodeType::LengthType>();
+  retval += node.length;
   return retval;
 }
 
-size_t lengthFromLongNode(const RLENode& node) {
-  return lengthFromPair(node.prefix, node.length);
+template <class NodeType>
+NodeType makeLongNode(size_t length, uint8_t value) {
+  size_t loLength = length & NodeType::LengthMax;
+  size_t hiLength = length >> bitsizeof<NodeType::LengthType>();
+  return NodeType{ (typename NodeType::PrefixType)hiLength, (typename NodeType::LengthType)loLength, value };
 }
 
-RLENode makeLongNode(size_t length, uint8_t value) {
-  size_t loLength = length & RLENode::LengthMax;
-  size_t hiLength = length >> bitsizeof<RLENode::LengthType>();
-  return RLENode{ (RLENode::OffsetType)hiLength, (RLENode::LengthType)loLength, value };
-}
-
-std::vector<RLENode> parseRuns(const std::vector<Run>& runs) {
-  std::vector<RLENode> table;
+template <class NodeType>
+std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
+  std::vector<NodeType> table;
   table.reserve(100);
 
-  size_t previousNodeTail = 0;
   for(auto& run : runs) {
-    //Ensure that offset from previous tail is short enough for OffsetType
-    size_t runOffset = run.position - previousNodeTail;
-    size_t                gaps = runOffset / RLENode::OffsetMax;
-    RLENode::OffsetType offset = runOffset % RLENode::OffsetMax;
+    //Ensure that prefix is short enough for PrefixType
+    size_t                          gaps = run.prefix / NodeType::PrefixMax;
+    typename NodeType::PrefixType prefix = run.prefix % NodeType::PrefixMax;
     if(gaps) {
-      //zero-length node with non-zero value represents "advance tail by (offset * value)"
+      //zero-length node with non-zero value represents "advance tail by (prefix * value)"
       while(gaps > std::numeric_limits<byte>::max()) {
-        table.push_back({ RLENode::OffsetMax, 0, (byte)std::numeric_limits<byte>::max() });
+        table.push_back({ NodeType::PrefixMax, 0, (byte)std::numeric_limits<byte>::max() });
         gaps -= std::numeric_limits<byte>::max();
       }
-      table.push_back({ RLENode::OffsetMax, 0, (byte)gaps });
+      table.push_back({ NodeType::PrefixMax, 0, (byte)gaps });
     }
 
+    //Ensure that length is short enough for LengthType
     size_t length = run.length;
-    if(length > RLENode::LengthMax) {
-      constexpr size_t LONG_NODE_MAX_LENGTH = lengthFromPair(RLENode::OffsetMax, RLENode::LengthMax);
+    if(length > NodeType::LengthMax) {
+      constexpr size_t LONG_NODE_MAX_LENGTH = lengthFromLongNode(NodeType{ NodeType::PrefixMax, NodeType::LengthMax, 0 });
 
+      //push maxxed-out "long nodes" until length is less than long node max
       while(length > LONG_NODE_MAX_LENGTH) {
-        table.push_back({ offset, 0, 0 });
-        offset = 0;
-        table.push_back({ RLENode::OffsetMax, RLENode::LengthMax, run.value });
+        table.push_back({ prefix, 0, 0 });
+        prefix = 0;
+        table.push_back({ NodeType::PrefixMax, NodeType::LengthMax, run.value });
         length -= LONG_NODE_MAX_LENGTH;
       }
-      if(length > RLENode::LengthMax) {
-        table.push_back({ offset, 0, 0 });
-        offset = 0;
-        table.push_back(makeLongNode(length, run.value));
-        length = 0;
+      //if remaining length is still too large for a standard node then push a long node
+      if(length > NodeType::LengthMax) {
+        table.push_back({ prefix, 0, 0 });
+        prefix = 0;
+        table.push_back(makeLongNode<NodeType>(length, run.value));
+        length = 0; //in this case the long node will cover all remaining length
       }
     }
+    //if length remains then push a standard node
     if(length) {
-      table.push_back({ offset, (RLENode::LengthType)length, run.value });
+      table.push_back({ prefix, (typename NodeType::LengthType)length, run.value });
     }
-
-    previousNodeTail = run.position + run.length;
   }
 
   return table;
 }
 
-int64_t checkTableBytesSaved(const std::vector<RLENode>& table) {
-  size_t tableLength = table.size() * sizeof(PackedRLENode);
+template <class NodeType, class PackedNodeType>
+int64_t checkTableBytesSaved(const std::vector<NodeType>& table) {
+  size_t tableLength = table.size() * sizeof(PackedNodeType);
   size_t totalRunsLength = 0;
   for(auto& node : table) { totalRunsLength += node.length; }
   return totalRunsLength - tableLength;
 }
 
-std::vector<PackedRLENode> packTable(const std::vector<RLENode>& unpackedTable) {
-  std::vector<PackedRLENode> packedTable;
+template <class NodeType, class PackedNodeType>
+std::vector<PackedNodeType> packTable(const std::vector<NodeType>& unpackedTable) {
+  std::vector<PackedNodeType> packedTable;
   packedTable.reserve(unpackedTable.size());
   for(auto& node : unpackedTable) {
     packedTable.push_back({ node.prefix, node.length, node.value });
@@ -170,8 +160,9 @@ std::vector<PackedRLENode> packTable(const std::vector<RLENode>& unpackedTable) 
   return packedTable;
 }
 
-std::vector<RLENode> unpackTable(const std::vector<PackedRLENode>& packedTable) {
-  std::vector<RLENode> unpackedTable;
+template <class NodeType, class PackedNodeType>
+std::vector<NodeType> unpackTable(const std::vector<PackedNodeType>& packedTable) {
+  std::vector<NodeType> unpackedTable;
   unpackedTable.reserve(packedTable.size());
   for(auto& node : packedTable) {
     unpackedTable.push_back({ node.prefix, node.length, node.value });
@@ -179,7 +170,8 @@ std::vector<RLENode> unpackTable(const std::vector<PackedRLENode>& packedTable) 
   return unpackedTable;
 }
 
-void writeDeflatedFile(const std::vector<byte>& data, const std::vector<RLENode>& table, const std::string& filename) {
+template <class NodeType, class PackedNodeType>
+void writeDeflatedFile(const std::vector<byte>& data, const std::vector<NodeType>& table, const std::string& filename) {
   auto file = std::ofstream(filename, std::ios::binary);
   if(!file) { throw std::runtime_error("Could not open output file."); }
   
@@ -189,8 +181,8 @@ void writeDeflatedFile(const std::vector<byte>& data, const std::vector<RLENode>
   }
   uint32_t tableNodeCount = (uint32_t)tsz;
   file.write(reinterpret_cast<const char*>(&tableNodeCount), sizeof(tableNodeCount));
-  auto packedTable = packTable(table);
-  file.write(reinterpret_cast<const char*>(packedTable.data()), (std::streamsize)tableNodeCount * sizeof(std::remove_reference<decltype(table)>::type::value_type));
+  auto packedTable = packTable<NodeType, PackedNodeType>(table);
+  file.write(reinterpret_cast<const char*>(packedTable.data()), (std::streamsize)tableNodeCount * sizeof(std::remove_reference<decltype(packedTable)>::type::value_type));
 
   //begin writing deflated data
   const char* dataPtr = reinterpret_cast<const char*>(data.data());
@@ -219,6 +211,7 @@ void writeDeflatedFile(const std::vector<byte>& data, const std::vector<RLENode>
   file.write(dataPtr, dataEndPtr - dataPtr);
 }
 
+template <class NodeType, class PackedNodeType>
 void inflateFile(const std::string& srcFilename, const std::string& dstFilename) {
   //open both files
   auto src = std::ifstream(srcFilename, std::ios::binary);
@@ -235,9 +228,9 @@ void inflateFile(const std::string& srcFilename, const std::string& dstFilename)
   uint32_t tableNodeCount;
   src.read(reinterpret_cast<char*>(&tableNodeCount), sizeof(tableNodeCount));
   if(!src.good()) { throw "derp"; }
-  std::vector<PackedRLENode> packedTable(tableNodeCount);
+  std::vector<PackedNodeType> packedTable(tableNodeCount);
   src.read(reinterpret_cast<char*>(packedTable.data()), (std::streamsize)tableNodeCount * sizeof(decltype(packedTable)::value_type));
-  auto table = unpackTable(packedTable);
+  auto table = unpackTable<NodeType, PackedNodeType>(packedTable);
 
   //process nodes
   bool longNode = false;
@@ -277,16 +270,29 @@ void inflateFile(const std::string& srcFilename, const std::string& dstFilename)
 }
 
 int main() {
-  std::cout << sizeof(RLENode) << "\n";
-  std::cout << sizeof(PackedRLENode) << "\n";
-  system("pause");
+  using RLENode = BaseRLENode<uint8_t, uint8_t>;
+  using PackedRLENode = BasePackedRLENode<RLENode::PrefixType, RLENode::LengthType>;
 
-#ifdef HERPDERP
-  auto data = loadFile("testfile.txt");
-  auto runs = collectRuns(data);
-  auto table = parseRuns(runs);
-  
-  writeDeflatedFile(data, table, "deflated.rle");
-  inflateFile("deflated.rle", "inflated.txt");
-#endif
+  std::cout << "Node size: " << sizeof(RLENode) << "\n";
+  std::cout << "Packed Node size: " << sizeof(PackedRLENode) << "\n\n";
+
+  std::string testfile = "testfile.txt";
+  std::string deflated = "deflated.bin";
+  std::string inflated = "inflated.bin";
+
+  auto data = loadFile(testfile);
+  auto runs = collectRuns<PackedRLENode>(data);
+  auto table = parseRuns<RLENode>(runs);
+  writeDeflatedFile<RLENode, PackedRLENode>(data, table, deflated);
+  inflateFile<RLENode, PackedRLENode>(deflated, inflated);
+
+  auto infData = loadFile(inflated);
+  std::cout << "Equality Test: " << (infData == data ? "Pass" : "Fail") << "\n";
+  auto defData = loadFile(deflated);
+  auto compression = (float)((defData.size() * 10000) / infData.size()) / 100;
+  std::cout << "Compressed Length Percentage: " << compression << "\n";
+  auto bytesSaved = checkTableBytesSaved<RLENode, PackedRLENode>(table);
+  std::cout << "Table bytes saved: " << bytesSaved << "\n";
+  std::cout << std::endl;
+  system("pause");
 }
