@@ -39,8 +39,9 @@ struct BasePackedRLENode {
 using Run = BaseRLENode<size_t, size_t>;
 
 template<class T>
-constexpr size_t bitsizeof() {
-  return sizeof(T) * 8;
+constexpr size_t bitsizeof(T = T{}) {
+  constexpr size_t BITS_PER_BYTE = 8;
+  return sizeof(T) * BITS_PER_BYTE;
 }
 
 std::vector<byte> loadFile(const std::string& filename) {
