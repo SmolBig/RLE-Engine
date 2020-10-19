@@ -147,8 +147,8 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="MappedFile.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="MappedFile.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="MappedFile.h" />

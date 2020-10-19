@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <stdexcept>
 
+//~~#
 void throwWindowsError() {
   LPSTR buffer = NULL;
   FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER, NULL, GetLastError(), 0, (LPSTR)&buffer, 0, NULL);
@@ -11,6 +12,7 @@ void throwWindowsError() {
   throw std::runtime_error(msg);
 }
 
+//~~#
 MappedFile::MappedFile(const std::string& filename, CreationDisposition disposition, uint64_t desiredLength) {
   DWORD disp = OPEN_EXISTING;
   if(disposition == CreationDisposition::CREATE) {
@@ -32,26 +34,30 @@ MappedFile::MappedFile(const std::string& filename, CreationDisposition disposit
   length = size.QuadPart;
 }
 
+//~~#
 MappedFile::~MappedFile() {
   CloseHandle(map);
   CloseHandle(file);
 }
 
+//~~#
 MappedFile::View MappedFile::getView(uint64_t offset, size_t viewLength) {
   LARGE_INTEGER liOffset;
   liOffset.QuadPart = offset;
   void* ptr = MapViewOfFile(map, FILE_MAP_WRITE, liOffset.HighPart, liOffset.LowPart, viewLength);
   if(ptr == nullptr) { throwWindowsError(); }
-  return View(reinterpret_cast<char*>(ptr), viewLength);
+  return View(reinterpret_cast<byte*>(ptr), viewLength);
 }
 
-MappedFile::View::View(char* data, size_t length) :
+//~~#
+MappedFile::View::View(byte* data, size_t length) :
   ptr(data),
-  std::span<char>(data, length)
+  std::span<byte>(data, length)
 {
   //nop
 }
 
+//~~#
 MappedFile::View::~View() {
   FlushViewOfFile(ptr, 0);
   UnmapViewOfFile(ptr);
