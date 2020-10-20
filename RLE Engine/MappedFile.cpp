@@ -12,10 +12,12 @@ void throwWindowsError() {
   throw std::runtime_error(msg);
 }
 
+// class RAIIHandle
 // Simple RAII wrapper for exception safety in MappedFile constructor
-//
 // Releases assigned handle on destruction unless commit() has been called, 
 //   or handle value is NULL or INVALID_HANDLE_VALUE.
+// Automatic conversion to and from HANDLE, so it can be used as a drop-in
+//   solution.
 class RAIIHandle {
 public:
   RAIIHandle(HANDLE h) { handle = h; }
@@ -57,7 +59,7 @@ MappedFile::MappedFile(const std::string& filename, CreationDisposition disposit
   // Map file
   LARGE_INTEGER size;
   size.QuadPart = desiredLength;
-  RAIIHandle hMap = CreateFileMappingA(file, NULL, PAGE_READWRITE, size.HighPart, size.LowPart, NULL);
+  RAIIHandle hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, size.HighPart, size.LowPart, NULL);
   if(hMap == nullptr) { throwWindowsError(); }
 
   // Since mapping with a length exceeding the file length will grow the file, fetch

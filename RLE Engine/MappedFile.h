@@ -2,14 +2,11 @@
 #include <span>
 #include <string>
 
-/// <summary>
 /// class MappedFile
 /// Opens a file and memory maps it using the Win32 API.
 /// Provides an interface for generating views for the mapped file.
-/// 
 /// This class can be used to open or create files which can be read from
 ///   and written to as if they were sections of main memory.
-/// </summary>
 class MappedFile {
   // Stand-in for std::byte until that type is better integrated.
   using byte = unsigned char;
