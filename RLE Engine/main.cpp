@@ -5,8 +5,6 @@
 #include <filesystem>
 #include "MappedFile.h"
 
-//~~@ modify skip node to use shifted bits instead of multiplication
-
 /*~~_ implement system to determine most efficient node type based on runs vector
  * - run parseRuns for each available type
  * - once it works, thread the tests
@@ -52,19 +50,19 @@ struct Header {
   uint64_t decompressedLength = 0;
   uint32_t tableNodeCount = 0;
 
-  enum class NodeType {
+  enum class NodeFormat {
     P8L8   = 0x11,
     P8L16  = 0x12,
     P16L8  = 0x21,
     P16L16 = 0x22,
   };
 
-  NodeType checkMagic() {
+  NodeFormat checkMagic() {
     static const std::string EXPECT = "RLE";
     if(!std::equal(EXPECT.begin(), EXPECT.end(), std::span(magic).begin())) {
       throw std::runtime_error("Attempted to decompress a non RLE file.");
     }
-    return (NodeType)magic[3];
+    return (NodeFormat)magic[3];
   }
 };
 #pragma pack(pop)
@@ -118,16 +116,21 @@ std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
 
   for(auto& run : runs) {
     //Ensure that prefix is short enough for PrefixType
-    size_t                          gaps = run.prefix / NodeType::PrefixMax;
-    typename NodeType::PrefixType prefix = run.prefix % NodeType::PrefixMax;
-    if(gaps) {
-      //zero-length node with non-zero value represents "advance tail by (prefix * value)"
-      //~~@ convert from multiplier to high-bits
-      while(gaps > std::numeric_limits<uint8_t>::max()) {
-        table.push_back({ NodeType::PrefixMax, 0, (std::byte)std::numeric_limits<std::byte>::max() });
-        gaps -= std::numeric_limits<uint8_t>::max();
-      }
-      table.push_back({ NodeType::PrefixMax, 0, (std::byte)gaps });
+    //zero-length node with non-zero value represents "advance tail by N" where N is an
+    //  unsigned integer with prefix as low bits and value as high bits.
+    uint64_t prefix = run.prefix;
+    constexpr size_t maxSkipLength = (NodeType::PrefixMax << bitsizeof<uint8_t>()) | std::numeric_limits<uint8_t>::max();
+    while(prefix > maxSkipLength) {
+      table.push_back({ NodeType::PrefixMax, 0, (std::byte)std::numeric_limits<uint8_t>::max() });
+      prefix -= maxSkipLength;
+    }
+    if(prefix > NodeType::PrefixMax) {
+      uint64_t loBits = prefix & NodeType::PrefixMax;
+      typename NodeType::PrefixType tmpPrefix = (typename NodeType::PrefixType)loBits;
+      uint64_t hiBits = prefix >> bitsizeof<uint8_t>();
+      std::byte tmpValue = (std::byte)hiBits;
+      table.push_back({ tmpPrefix, 0, tmpValue });
+      prefix = 0;
     }
 
     //Ensure that length is short enough for LengthType
@@ -137,14 +140,14 @@ std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
 
       //push maxxed-out "long nodes" until length is less than long node max
       while(length > LONG_NODE_MAX_LENGTH) {
-        table.push_back({ prefix, 0, (std::byte)0 });
+        table.push_back({ (typename NodeType::PrefixType)prefix, 0, (std::byte)0 });
         prefix = 0;
         table.push_back({ NodeType::PrefixMax, NodeType::LengthMax, run.value });
         length -= LONG_NODE_MAX_LENGTH;
       }
       //if remaining length is still too large for a standard node then push a long node
       if(length > NodeType::LengthMax) {
-        table.push_back({ prefix, 0, (std::byte)0 });
+        table.push_back({ (typename NodeType::PrefixType)prefix, 0, (std::byte)0 });
         prefix = 0;
         table.push_back(makeLongNode<NodeType>(length, run.value));
         length = 0; //in this case the long node will cover all remaining length
@@ -152,7 +155,7 @@ std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
     }
     //if length remains then push a standard node
     if(length) {
-      table.push_back({ prefix, (typename NodeType::LengthType)length, run.value });
+      table.push_back({ (typename NodeType::PrefixType)prefix, (typename NodeType::LengthType)length, run.value });
     }
   }
 
@@ -232,7 +235,7 @@ void writeDeflatedFile(const std::span<std::byte>& data, const std::vector<NodeT
           longNode = true;
         }
         else {
-          prefixLength *= (uint8_t)node.value; //~~@
+          prefixLength |= (size_t)node.value << bitsizeof(node.prefix);
         }
       }
       auto tailIter = srcIter + prefixLength;
@@ -290,7 +293,7 @@ void inflateFile(const std::string& srcFilename, const std::string& dstFilename)
         longNode = true;
       }
       else {
-        bytesToCopy *= (uint8_t)node.value; //~~@ convert from multiplier to high-bits
+        bytesToCopy |= (size_t)node.value << bitsizeof(packedTable[0].prefix);
       }
     }
 
