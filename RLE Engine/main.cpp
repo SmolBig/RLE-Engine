@@ -17,8 +17,6 @@
 
 //~~_ get a nice set of various test files going; make sure they test skip/long nodes (and combos)
 
-using byte = uint8_t;
-
 template <typename PrefixT, typename LengthT>
 struct BaseRLENode {
   using PrefixType = PrefixT;
@@ -28,7 +26,7 @@ struct BaseRLENode {
 
   PrefixType prefix; //number of preceeding non-run bytes
   LengthType length;
-  byte value;
+  std::byte value;
 
   //~~@ add functions to make special node types
 };
@@ -38,7 +36,7 @@ template <typename PrefixT, typename LengthT>
 struct BasePackedRLENode {
   PrefixT prefix;
   LengthT length;
-  byte value;
+  std::byte value;
 };
 #pragma pack(pop)
 
@@ -73,7 +71,7 @@ struct Header {
 
 using Run = BaseRLENode<uint64_t, uint64_t>;
 
-std::vector<Run> collectRuns(const std::span<byte>& data) {
+std::vector<Run> collectRuns(const std::span<std::byte>& data) {
   std::vector<Run> runs;
   runs.reserve(100);
 
@@ -88,7 +86,7 @@ std::vector<Run> collectRuns(const std::span<byte>& data) {
       run.length++;
     }
 
-    if(run.length > sizeof(BasePackedRLENode<byte, byte>)) {
+    if(run.length > sizeof(BasePackedRLENode<uint8_t, uint8_t>)) {
       run.prefix = position - prevTailPos;
       runs.push_back(run);
       prevTailPos = position + run.length;
@@ -107,7 +105,7 @@ constexpr size_t lengthFromLongNode(const NodeType& node) {
 }
 
 template <class NodeType>
-NodeType makeLongNode(size_t length, uint8_t value) {
+NodeType makeLongNode(size_t length, std::byte value) {
   size_t loLength = length & NodeType::LengthMax;
   size_t hiLength = length >> bitsizeof<NodeType::LengthType>();
   return NodeType{ (typename NodeType::PrefixType)hiLength, (typename NodeType::LengthType)loLength, value };
@@ -125,28 +123,28 @@ std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
     if(gaps) {
       //zero-length node with non-zero value represents "advance tail by (prefix * value)"
       //~~@ convert from multiplier to high-bits
-      while(gaps > std::numeric_limits<byte>::max()) {
-        table.push_back({ NodeType::PrefixMax, 0, (byte)std::numeric_limits<byte>::max() });
-        gaps -= std::numeric_limits<byte>::max();
+      while(gaps > std::numeric_limits<uint8_t>::max()) {
+        table.push_back({ NodeType::PrefixMax, 0, (std::byte)std::numeric_limits<std::byte>::max() });
+        gaps -= std::numeric_limits<uint8_t>::max();
       }
-      table.push_back({ NodeType::PrefixMax, 0, (byte)gaps });
+      table.push_back({ NodeType::PrefixMax, 0, (std::byte)gaps });
     }
 
     //Ensure that length is short enough for LengthType
     size_t length = run.length;
     if(length > NodeType::LengthMax) {
-      constexpr size_t LONG_NODE_MAX_LENGTH = lengthFromLongNode(NodeType{ NodeType::PrefixMax, NodeType::LengthMax, 0 });
+      constexpr size_t LONG_NODE_MAX_LENGTH = lengthFromLongNode(NodeType{ NodeType::PrefixMax, NodeType::LengthMax, (std::byte)0 });
 
       //push maxxed-out "long nodes" until length is less than long node max
       while(length > LONG_NODE_MAX_LENGTH) {
-        table.push_back({ prefix, 0, 0 });
+        table.push_back({ prefix, 0, (std::byte)0 });
         prefix = 0;
         table.push_back({ NodeType::PrefixMax, NodeType::LengthMax, run.value });
         length -= LONG_NODE_MAX_LENGTH;
       }
       //if remaining length is still too large for a standard node then push a long node
       if(length > NodeType::LengthMax) {
-        table.push_back({ prefix, 0, 0 });
+        table.push_back({ prefix, 0, (std::byte)0 });
         prefix = 0;
         table.push_back(makeLongNode<NodeType>(length, run.value));
         length = 0; //in this case the long node will cover all remaining length
@@ -170,7 +168,7 @@ int64_t checkTableBytesSaved(const std::vector<NodeType>& table) {
 }
 
 template <class NodeType, class PackedNodeType>
-size_t packTable(const std::vector<NodeType>& unpackedTable, std::span<byte> target) {
+size_t packTable(const std::vector<NodeType>& unpackedTable, std::span<std::byte> target) {
   size_t packedTableSize = unpackedTable.size() * sizeof(PackedNodeType);
   if(target.size() < packedTableSize) {
     throw std::runtime_error("Target span too short to fit packed table.");
@@ -199,7 +197,7 @@ std::vector<Run> unpackTable(const PackedNodeContainer& packedTable) {
 }
 
 template <class NodeType, class PackedNodeType>
-void writeDeflatedFile(const std::span<byte>& data, const std::vector<NodeType>& table, const std::string& filename) {
+void writeDeflatedFile(const std::span<std::byte>& data, const std::vector<NodeType>& table, const std::string& filename) {
   if(table.size() > std::numeric_limits<uint32_t>::max()) { throw std::runtime_error("Table size too large."); }
 
   size_t outfileLength = 0; //~~@ NodeType system should allow outfile length to be predicted
@@ -215,7 +213,7 @@ void writeDeflatedFile(const std::span<byte>& data, const std::vector<NodeType>&
     header->tableNodeCount = (uint32_t)table.size();
     dstIter += sizeof(Header);
 
-    dstIter += packTable<NodeType, PackedNodeType>(table, std::span<byte>(dstIter, view.end()));
+    dstIter += packTable<NodeType, PackedNodeType>(table, std::span<std::byte>(dstIter, view.end()));
 
     //begin writing deflated data
     auto srcIter = data.begin();
@@ -230,11 +228,11 @@ void writeDeflatedFile(const std::span<byte>& data, const std::vector<NodeType>&
 
       size_t prefixLength = node.prefix;
       if(node.length == 0) {
-        if(node.value == 0) {
+        if(node.value == (std::byte)0) {
           longNode = true;
         }
         else {
-          prefixLength *= node.value; //~~@
+          prefixLength *= (uint8_t)node.value; //~~@
         }
       }
       auto tailIter = srcIter + prefixLength;
@@ -288,11 +286,11 @@ void inflateFile(const std::string& srcFilename, const std::string& dstFilename)
 
     size_t bytesToCopy = node.prefix;
     if(node.length == 0) {
-      if(node.value == 0) {
+      if(node.value == (std::byte)0) {
         longNode = true;
       }
       else {
-        bytesToCopy *= node.value; //~~@ convert from multiplier to high-bits
+        bytesToCopy *= (uint8_t)node.value; //~~@ convert from multiplier to high-bits
       }
     }
 

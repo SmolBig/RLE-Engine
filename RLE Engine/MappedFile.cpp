@@ -89,11 +89,11 @@ MappedFile::View MappedFile::getView(uint64_t offset, size_t viewLength) {
   liOffset.QuadPart = offset;
   void* ptr = MapViewOfFile(map, FILE_MAP_WRITE, liOffset.HighPart, liOffset.LowPart, viewLength);
   if(ptr == nullptr) { throwWindowsError(); }
-  return View(reinterpret_cast<byte*>(ptr), viewLength);
+  return View(reinterpret_cast<std::byte*>(ptr), viewLength);
 }
 
-MappedFile::View::View(byte* data, size_t length) :
-  std::span<byte>(data, length), //note that this ctor executes first, regardless of list order
+MappedFile::View::View(std::byte* data, size_t length) :
+  std::span<std::byte>(data, length), //note that this ctor executes first, regardless of list order
   ptr(data)
 {
   //nop

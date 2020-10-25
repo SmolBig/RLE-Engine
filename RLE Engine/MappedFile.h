@@ -8,9 +8,6 @@
 /// This class can be used to open or create files which can be read from
 ///   and written to as if they were sections of main memory.
 class MappedFile {
-  // Stand-in for std::byte until that type is better integrated.
-  using byte = unsigned char;
-
 public:
   enum class CreationDisposition {
     OPEN, // Will open an existing file or throw a std::runtime_error if the file is not found.
@@ -41,14 +38,14 @@ public:
   // Note that views are invalidated when the MappedFile object which created them is
   //   destructed. View behavior beyond that point is undefined, but will probably
   //   (hopefully) result in a segfault.
-  class View : public std::span<byte> {
+  class View : public std::span<std::byte> {
     friend View MappedFile::getView(uint64_t offset, size_t length);
   public:
     ~View();
 
   private:
-    View(byte*, size_t);
-    byte* ptr;
+    View(std::byte*, size_t);
+    std::byte* ptr;
 
   };
 
