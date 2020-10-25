@@ -1,17 +1,22 @@
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <limits>
+#include <filesystem>
+#include "MappedFile.h"
 
-//~~@ use memory mapped files instead of file streams
-//~~_ RLE(X) header value, where X is node type (high nibble prefix byte ct, low nibble length byte ct)
-//~~_ modify inflate routine to use the header for determining node type
-//~~_ get a nice set of various test files going
-//~~_ implement system to determine most efficient node type based on runs vector
-//~~_ modify deflate routine to select and use most efficient node type
-//~~~ check compiler implementations to ensure that pack pragma behaves properly and that vector is treating it right (no filler between elements, etc)
+//~~@ replace fstreams with maps
+#include <fstream>
+
+//~~@ modify skip node to use shifted bits instead of multiplication
+/*~~_ implement system to determine most efficient node type based on runs vector
+ * - run parseRuns for each available type
+ * - once it works, thread the tests
+ * - return the best table and it's NodeType
+ * - modify the inflate routine to make use of the header-specified NodeType
+ * - apply the modification to the deflation routine
+ */
+//~~_ get a nice set of various test files going; make sure they test skip/long nodes (and combos)
 
 using byte = uint8_t;
 
@@ -22,9 +27,11 @@ struct BaseRLENode {
   using LengthType = LengthT;
   static constexpr size_t LengthMax = std::numeric_limits<LengthType>::max();
 
-  PrefixType prefix; //offset from previous node's tail
+  PrefixType prefix; //number of preceeding non-run bytes
   LengthType length;
   byte value;
+
+  //~~@ add functions to make special node types
 };
 
 #pragma pack(push, 1)
@@ -36,27 +43,39 @@ struct BasePackedRLENode {
 };
 #pragma pack(pop)
 
-using Run = BaseRLENode<size_t, size_t>;
-
 template<class T>
 constexpr size_t bitsizeof(T = T{}) {
   constexpr size_t BITS_PER_BYTE = 8;
   return sizeof(T) * BITS_PER_BYTE;
 }
 
-std::vector<byte> loadFile(const std::string& filename) {
-  std::vector<byte> data;
-  std::ifstream file(filename, std::ios::binary);
-  if(!file) { throw std::runtime_error("Could not open input file."); }
-  file.seekg(0, std::ios::end);
-  data.resize((size_t)file.tellg());
-  file.seekg(0, std::ios::beg);
-  file.read(reinterpret_cast<char*>(data.data()), data.size());
-  return data;
-}
+#pragma pack(push, 1)
+struct Header {
+  char magic[4] = "RLE";
+  uint64_t decompressedLength = 0;
+  uint32_t tableNodeCount = 0;
 
-template <class PackedNodeType>
-std::vector<Run> collectRuns(const std::vector<byte>& data) {
+  enum class NodeType {
+    P8L8   = 0x11,
+    P8L16  = 0x12,
+    P16L8  = 0x21,
+    P16L16 = 0x22,
+  };
+
+  NodeType checkMagic() {
+    static const std::string EXPECT = "RLE";
+    if(!std::equal(EXPECT.begin(), EXPECT.end(), std::span(magic).begin())) {
+      throw std::runtime_error("Attempted to decompress a non RLE file.");
+    }
+    return (NodeType)magic[3];
+  }
+};
+#pragma pack(pop)
+
+using Run = BaseRLENode<uint64_t, uint64_t>;
+
+template <class PackedNodeType, class ContainerType>
+std::vector<Run> collectRuns(const ContainerType& data) {
   std::vector<Run> runs;
   runs.reserve(100);
 
@@ -67,7 +86,7 @@ std::vector<Run> collectRuns(const std::vector<byte>& data) {
     run.length = 1;
     run.value = data[i];
 
-    while((++i < data.size()) && (data[i] == run.value)) {
+    while((++i < data.size()) && (data[i] == run.value) && (run.length < std::numeric_limits<decltype(run.length)>::max())) {
       run.length++;
     }
 
@@ -107,6 +126,7 @@ std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
     typename NodeType::PrefixType prefix = run.prefix % NodeType::PrefixMax;
     if(gaps) {
       //zero-length node with non-zero value represents "advance tail by (prefix * value)"
+      //~~@ convert from multiplier to high-bits
       while(gaps > std::numeric_limits<byte>::max()) {
         table.push_back({ NodeType::PrefixMax, 0, (byte)std::numeric_limits<byte>::max() });
         gaps -= std::numeric_limits<byte>::max();
@@ -161,9 +181,9 @@ std::vector<PackedNodeType> packTable(const std::vector<NodeType>& unpackedTable
   return packedTable;
 }
 
-template <class NodeType, class PackedNodeType>
-std::vector<NodeType> unpackTable(const std::vector<PackedNodeType>& packedTable) {
-  std::vector<NodeType> unpackedTable;
+template <class PackedNodeContainer>
+std::vector<Run> unpackTable(const PackedNodeContainer& packedTable) {
+  std::vector<Run> unpackedTable;
   unpackedTable.reserve(packedTable.size());
   for(auto& node : packedTable) {
     unpackedTable.push_back({ node.prefix, node.length, node.value });
@@ -171,19 +191,22 @@ std::vector<NodeType> unpackTable(const std::vector<PackedNodeType>& packedTable
   return unpackedTable;
 }
 
-template <class NodeType, class PackedNodeType>
-void writeDeflatedFile(const std::vector<byte>& data, const std::vector<NodeType>& table, const std::string& filename) {
-  auto file = std::ofstream(filename, std::ios::binary);
+template <class NodeType, class PackedNodeType, class ContainerType>
+void writeDeflatedFile(const ContainerType& data, const std::vector<NodeType>& table, const std::string& filename) {
+  auto file = std::ofstream(filename, std::ios::binary); //~~@ use a map
   if(!file) { throw std::runtime_error("Could not open output file."); }
   
   size_t tsz = table.size();
   if(tsz > std::numeric_limits<uint32_t>::max()) {
     throw std::runtime_error("Table size too large. (Insanely large. What on earth are you deflating?");
   }
-  uint32_t tableNodeCount = (uint32_t)tsz;
-  file.write(reinterpret_cast<const char*>(&tableNodeCount), sizeof(tableNodeCount));
+  Header header;
+  header.magic[3] = 0x11; //~~_ determine best node type to use and indicate it here
+  header.decompressedLength = (uint32_t)data.size();
+  header.tableNodeCount = (uint32_t)tsz;
+  file.write(reinterpret_cast<const char*>(&header), sizeof(header));
   auto packedTable = packTable<NodeType, PackedNodeType>(table);
-  file.write(reinterpret_cast<const char*>(packedTable.data()), (std::streamsize)tableNodeCount * sizeof(std::remove_reference<decltype(packedTable)>::type::value_type));
+  file.write(reinterpret_cast<const char*>(packedTable.data()), (std::streamsize)header.tableNodeCount * sizeof(std::remove_reference<decltype(packedTable)>::type::value_type));
 
   //begin writing deflated data
   const char* dataPtr = reinterpret_cast<const char*>(data.data());
@@ -202,7 +225,7 @@ void writeDeflatedFile(const std::vector<byte>& data, const std::vector<NodeType
         longNode = true;
       }
       else {
-        bytesToCopy *= node.value;
+        bytesToCopy *= node.value; //~~@
       }
     }
     file.write(dataPtr, bytesToCopy);
@@ -214,33 +237,34 @@ void writeDeflatedFile(const std::vector<byte>& data, const std::vector<NodeType
 
 template <class NodeType, class PackedNodeType>
 void inflateFile(const std::string& srcFilename, const std::string& dstFilename) {
-  //open both files
-  auto src = std::ifstream(srcFilename, std::ios::binary);
-  if(!src) { throw std::runtime_error("Could not open source file."); }
-  auto dst = std::ofstream(dstFilename, std::ios::binary);
-  if(!dst) { throw std::runtime_error("Could not open destination file."); }
+  MappedFile srcMap(srcFilename, MappedFile::CreationDisposition::OPEN);
+  if(srcMap.size() > std::numeric_limits<size_t>::max()) {
+    //~~_ use rolling view to accomodate this instead of throwing
+    throw std::runtime_error("File too large to unpack. (large file support not yet implemented)");
+  }
+  auto srcView = srcMap.getView(0, srcMap.size());
+  auto srcIter = srcView.begin();
 
-  //determine length of source file
-  src.seekg(0, std::ios::end);
-  size_t srcLength = (size_t)src.tellg();
-  src.seekg(0, std::ios::beg);
+  Header* headerPtr = reinterpret_cast<Header*>(&srcView[0]);
+  srcIter += sizeof(Header);
+  headerPtr->checkMagic(); //~~_ return value is node type, which should be caught and used
 
-  //read in RLE table
-  uint32_t tableNodeCount;
-  src.read(reinterpret_cast<char*>(&tableNodeCount), sizeof(tableNodeCount));
-  if(!src.good()) { throw "derp"; }
-  std::vector<PackedNodeType> packedTable(tableNodeCount);
-  src.read(reinterpret_cast<char*>(packedTable.data()), (std::streamsize)tableNodeCount * sizeof(decltype(packedTable)::value_type));
-  auto table = unpackTable<NodeType, PackedNodeType>(packedTable);
+  PackedNodeType* firstNodePtr = reinterpret_cast<PackedNodeType*>(&srcView[sizeof(Header)]);
+  std::span<PackedNodeType> packedTable(firstNodePtr, headerPtr->tableNodeCount);
+  auto table = unpackTable(packedTable);
+  srcIter += sizeof(PackedNodeType) * headerPtr->tableNodeCount;
 
-  //process nodes
+  MappedFile dstMap(dstFilename, MappedFile::CreationDisposition::CREATE, headerPtr->decompressedLength);
+  auto dstView = dstMap.getView(0, dstMap.size());
+  auto dstIter = dstView.begin();
+
   bool longNode = false;
   for(const auto& node : table) {
     if(longNode) {
       size_t longLength = lengthFromLongNode(node);
-      for(size_t i = 0; i < longLength; i++) {
-        dst.write(reinterpret_cast<const char*>(&node.value), 1);
-      }
+      auto tail = dstIter + longLength;
+      std::fill(dstIter, tail, node.value);
+      dstIter = tail;
       longNode = false;
       continue;
     }
@@ -251,23 +275,21 @@ void inflateFile(const std::string& srcFilename, const std::string& dstFilename)
         longNode = true;
       }
       else {
-        bytesToCopy *= node.value;
+        bytesToCopy *= node.value; //~~@ convert from multiplier to high-bits
       }
     }
 
-    std::vector<char> buffer(bytesToCopy);
-    src.read(buffer.data(), buffer.size());
-    dst.write(buffer.data(), buffer.size());
+    auto srcTail = srcIter + bytesToCopy;
+    std::copy(srcIter, srcTail, dstIter);
+    srcIter = srcTail;
+    dstIter += bytesToCopy;
 
-    for(size_t i = 0; i < node.length; i++) {
-      dst.write(reinterpret_cast<const char*>(&node.value), 1);
-    }
+    auto dstTail = dstIter + node.length;
+    std::fill(dstIter, dstTail, node.value);
+    dstIter = dstTail;
   }
 
-  //copy remaining bytes
-  std::vector<char> buffer(srcLength - (size_t)src.tellg());
-  src.read(buffer.data(), buffer.size());
-  dst.write(buffer.data(), buffer.size());
+  std::copy(srcIter, srcView.end(), dstIter);
 }
 
 int main() {
@@ -281,19 +303,27 @@ int main() {
   std::string deflated = "deflated.bin";
   std::string inflated = "inflated.bin";
 
-  auto data = loadFile(testfile);
+  std::filesystem::remove(deflated);
+  std::filesystem::remove(inflated);
+
+  MappedFile map(testfile, MappedFile::CreationDisposition::OPEN);
+  auto data = map.getView(0, map.size());
+
   auto runs = collectRuns<PackedRLENode>(data);
   auto table = parseRuns<RLENode>(runs);
   writeDeflatedFile<RLENode, PackedRLENode>(data, table, deflated);
   inflateFile<RLENode, PackedRLENode>(deflated, inflated);
 
-  auto infData = loadFile(inflated);
-  std::cout << "Equality Test: " << (infData == data ? "Pass" : "Fail") << "\n";
-  auto defData = loadFile(deflated);
-  auto compression = (float)((defData.size() * 10000) / infData.size()) / 100;
+  MappedFile infMap(inflated, MappedFile::CreationDisposition::OPEN);
+  auto infData = infMap.getView(0, infMap.size());
+  std::cout << "Equality Test: " << (std::equal(infData.begin(), infData.end(), data.begin(), data.end()) ? "Pass" : "Fail") << "\n";
+  MappedFile defMap(deflated, MappedFile::CreationDisposition::OPEN);
+  auto compression = (float)((defMap.size() * 10000) / infMap.size()) / 100;
   std::cout << "Compressed Length Percentage: " << compression << "\n";
   auto bytesSaved = checkTableBytesSaved<RLENode, PackedRLENode>(table);
   std::cout << "Table bytes saved: " << bytesSaved << "\n";
   std::cout << std::endl;
+
   system("pause");
+
 }
