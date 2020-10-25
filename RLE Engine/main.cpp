@@ -5,10 +5,8 @@
 #include <filesystem>
 #include "MappedFile.h"
 
-//~~@ replace fstreams with maps
-#include <fstream>
-
 //~~@ modify skip node to use shifted bits instead of multiplication
+
 /*~~_ implement system to determine most efficient node type based on runs vector
  * - run parseRuns for each available type
  * - once it works, thread the tests
@@ -16,6 +14,7 @@
  * - modify the inflate routine to make use of the header-specified NodeType
  * - apply the modification to the deflation routine
  */
+
 //~~_ get a nice set of various test files going; make sure they test skip/long nodes (and combos)
 
 using byte = uint8_t;
@@ -74,8 +73,7 @@ struct Header {
 
 using Run = BaseRLENode<uint64_t, uint64_t>;
 
-template <class PackedNodeType, class ContainerType>
-std::vector<Run> collectRuns(const ContainerType& data) {
+std::vector<Run> collectRuns(const std::span<byte>& data) {
   std::vector<Run> runs;
   runs.reserve(100);
 
@@ -90,7 +88,7 @@ std::vector<Run> collectRuns(const ContainerType& data) {
       run.length++;
     }
 
-    if(run.length > sizeof(PackedNodeType)) {
+    if(run.length > sizeof(BasePackedRLENode<byte, byte>)) {
       run.prefix = position - prevTailPos;
       runs.push_back(run);
       prevTailPos = position + run.length;
@@ -172,13 +170,22 @@ int64_t checkTableBytesSaved(const std::vector<NodeType>& table) {
 }
 
 template <class NodeType, class PackedNodeType>
-std::vector<PackedNodeType> packTable(const std::vector<NodeType>& unpackedTable) {
-  std::vector<PackedNodeType> packedTable;
-  packedTable.reserve(unpackedTable.size());
-  for(auto& node : unpackedTable) {
-    packedTable.push_back({ node.prefix, node.length, node.value });
+size_t packTable(const std::vector<NodeType>& unpackedTable, std::span<byte> target) {
+  size_t packedTableSize = unpackedTable.size() * sizeof(PackedNodeType);
+  if(target.size() < packedTableSize) {
+    throw std::runtime_error("Target span too short to fit packed table.");
   }
-  return packedTable;
+
+  std::span<PackedNodeType> packSpan(reinterpret_cast<PackedNodeType*>(target.data()), unpackedTable.size());
+  auto iter = packSpan.begin();
+  for(auto& node : unpackedTable) {
+    iter->prefix = node.prefix;
+    iter->length = node.length;
+    iter->value = node.value;
+    ++iter;
+  }
+
+  return packedTableSize;
 }
 
 template <class PackedNodeContainer>
@@ -191,48 +198,58 @@ std::vector<Run> unpackTable(const PackedNodeContainer& packedTable) {
   return unpackedTable;
 }
 
-template <class NodeType, class PackedNodeType, class ContainerType>
-void writeDeflatedFile(const ContainerType& data, const std::vector<NodeType>& table, const std::string& filename) {
-  auto file = std::ofstream(filename, std::ios::binary); //~~@ use a map
-  if(!file) { throw std::runtime_error("Could not open output file."); }
-  
-  size_t tsz = table.size();
-  if(tsz > std::numeric_limits<uint32_t>::max()) {
-    throw std::runtime_error("Table size too large. (Insanely large. What on earth are you deflating?");
-  }
-  Header header;
-  header.magic[3] = 0x11; //~~_ determine best node type to use and indicate it here
-  header.decompressedLength = (uint32_t)data.size();
-  header.tableNodeCount = (uint32_t)tsz;
-  file.write(reinterpret_cast<const char*>(&header), sizeof(header));
-  auto packedTable = packTable<NodeType, PackedNodeType>(table);
-  file.write(reinterpret_cast<const char*>(packedTable.data()), (std::streamsize)header.tableNodeCount * sizeof(std::remove_reference<decltype(packedTable)>::type::value_type));
+template <class NodeType, class PackedNodeType>
+void writeDeflatedFile(const std::span<byte>& data, const std::vector<NodeType>& table, const std::string& filename) {
+  if(table.size() > std::numeric_limits<uint32_t>::max()) { throw std::runtime_error("Table size too large."); }
 
-  //begin writing deflated data
-  const char* dataPtr = reinterpret_cast<const char*>(data.data());
-  const char* const dataEndPtr = dataPtr + data.size();
-  bool longNode = false;
-  for(auto& node : table) {
-    if(longNode) {
-      dataPtr += lengthFromLongNode(node);
-      longNode = false;
-      continue;
+  size_t outfileLength = 0; //~~@ NodeType system should allow outfile length to be predicted
+
+  { //~~@ until NodeType sys is in place, we assume the compressed file is shorter than the decompressed one and we clip the difference after compression
+    MappedFile map(filename, MappedFile::CreationDisposition::CREATE, data.size());
+    auto view = map.getView(0, map.size());
+    auto dstIter = view.begin();
+
+    Header* header = new(view.data()) Header;
+    header->magic[3] = 0x11; //~~@ determine best node type to use and indicate it here
+    header->decompressedLength = (uint32_t)data.size();
+    header->tableNodeCount = (uint32_t)table.size();
+    dstIter += sizeof(Header);
+
+    dstIter += packTable<NodeType, PackedNodeType>(table, std::span<byte>(dstIter, view.end()));
+
+    //begin writing deflated data
+    auto srcIter = data.begin();
+    bool longNode = false;
+    for(auto& node : table) {
+      if(longNode) {
+        //move head past run (no prefix on long nodes)
+        srcIter += lengthFromLongNode(node);
+        longNode = false;
+        continue;
+      }
+
+      size_t prefixLength = node.prefix;
+      if(node.length == 0) {
+        if(node.value == 0) {
+          longNode = true;
+        }
+        else {
+          prefixLength *= node.value; //~~@
+        }
+      }
+      auto tailIter = srcIter + prefixLength;
+      dstIter = std::copy(srcIter, tailIter, dstIter);
+      //tailIter is past the prefix, add the run length to that to get the new srcIter
+      srcIter = tailIter + node.length;
     }
 
-    size_t bytesToCopy = node.prefix;
-    if(node.length == 0) {
-      if(node.value == 0) {
-        longNode = true;
-      }
-      else {
-        bytesToCopy *= node.value; //~~@
-      }
-    }
-    file.write(dataPtr, bytesToCopy);
-    dataPtr += bytesToCopy;
-    dataPtr += node.length;
+    //copy the remaining bytes and calculate the length of the compressed file
+    dstIter = std::copy(srcIter, data.end(), dstIter);
+    outfileLength = dstIter - view.begin();
   }
-  file.write(dataPtr, dataEndPtr - dataPtr);
+
+  //clip file length
+  std::filesystem::resize_file(std::filesystem::path(filename), outfileLength);
 }
 
 template <class NodeType, class PackedNodeType>
@@ -309,7 +326,7 @@ int main() {
   MappedFile map(testfile, MappedFile::CreationDisposition::OPEN);
   auto data = map.getView(0, map.size());
 
-  auto runs = collectRuns<PackedRLENode>(data);
+  auto runs = collectRuns(data);
   auto table = parseRuns<RLENode>(runs);
   writeDeflatedFile<RLENode, PackedRLENode>(data, table, deflated);
   inflateFile<RLENode, PackedRLENode>(deflated, inflated);
