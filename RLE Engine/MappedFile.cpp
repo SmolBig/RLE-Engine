@@ -62,12 +62,14 @@ MappedFile::MappedFile(const std::string& filename, CreationDisposition disposit
   RAIIHandle hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, size.HighPart, size.LowPart, NULL);
   if(hMap == nullptr) { throwWindowsError(); }
 
+  // We've got the goods, so go ahead and validate the temporaries into the members.
+  file = hFile.commit();
+  map = hMap.commit();
+
   // Since mapping with a length exceeding the file length will grow the file, fetch
   //   the filesize at this point to serve as the actual length of the file.
   GetFileSizeEx(file, &size);
   length = size.QuadPart;
-  file = hFile.commit();
-  map = hMap.commit();
 }
 
 MappedFile::~MappedFile() {
@@ -78,6 +80,11 @@ MappedFile::~MappedFile() {
 MappedFile::View MappedFile::getView(uint64_t offset, size_t viewLength) {
   // For some reason intellisense really hates this function, and commonly reports
   //   errors which do not actually exist.
+
+  if(viewLength == 0) {
+    throw std::runtime_error("MappedFile cannot generate a View object with a length of zero.");
+  }
+
   LARGE_INTEGER liOffset;
   liOffset.QuadPart = offset;
   void* ptr = MapViewOfFile(map, FILE_MAP_WRITE, liOffset.HighPart, liOffset.LowPart, viewLength);

@@ -31,8 +31,7 @@ public:
   class View; // forward declaration
 
   // Returns a View object with the indicated offset and length.
-  // Providing a length of zero will attempt to return a view from
-  //   the offset to the end of the file/map.
+  // Length may not be zero. Use MappedFile::size() to get map length.
   View getView(uint64_t offset, size_t length);
 
   // class MappedFile::View
