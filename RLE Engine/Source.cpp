@@ -461,9 +461,9 @@ void inflateFile(const std::string& inputFilename, const std::string& outputFile
   auto outIter = outView.begin();
 
   for(auto& node : table) {
-    auto tailIter = inIter + node.prefix;
-    outIter = std::copy(inIter, tailIter, outIter);
-    inIter = tailIter;
+    auto inTail = inIter + node.prefix;
+    outIter = std::copy(inIter, inTail, outIter);
+    inIter = inTail;
 
     auto outTail = outIter + node.length;
     std::fill(outIter, outTail, node.value);
@@ -476,3 +476,29 @@ void inflateFile(const std::string& inputFilename, const std::string& outputFile
   }
 }
 
+#include <filesystem>
+#include <iostream>
+
+int main() {
+  std::string testfile = "testfile.txt";
+  std::string deflated = testfile + ".rle";
+  std::string inflated = "reinflated.txt";
+
+  std::filesystem::remove(deflated);
+  std::filesystem::remove(inflated);
+
+  deflateFile(testfile, deflated);
+  inflateFile(deflated, inflated);
+
+  MappedFile infMap(inflated, MappedFile::CreationDisposition::OPEN);
+  auto infData = infMap.getView(0, infMap.size());
+  MappedFile defMap(deflated, MappedFile::CreationDisposition::OPEN);
+  auto defData = defMap.getView(0, defMap.size());
+  std::cout << "Equality Test: " << (std::equal(infData.begin(), infData.end(), defData.begin(), defData.end()) ? "Pass" : "Fail") << "\n";
+  auto compression = (float)((defMap.size() * 10000) / infMap.size()) / 100;
+  std::cout << "Compressed Length Percentage: " << compression << "\n";
+  std::cout << std::endl;
+
+  system("pause");
+
+}
