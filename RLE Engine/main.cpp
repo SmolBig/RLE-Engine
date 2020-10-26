@@ -16,7 +16,7 @@
 //~~_ get a nice set of various test files going; make sure they test skip/long nodes (and combos)
 
 template <typename PrefixT, typename LengthT>
-struct BaseRLENode {
+struct PackedNode {
   using PrefixType = PrefixT;
   static constexpr size_t PrefixMax = std::numeric_limits<PrefixType>::max();
   using LengthType = LengthT;
@@ -28,6 +28,8 @@ struct BaseRLENode {
 
   //~~@ add functions to make special node types
 };
+
+using Run = PackedNode<uint64_t, uint64_t>;
 
 #pragma pack(push, 1)
 template <typename PrefixT, typename LengthT>
@@ -66,8 +68,6 @@ struct Header {
   }
 };
 #pragma pack(pop)
-
-using Run = BaseRLENode<uint64_t, uint64_t>;
 
 std::vector<Run> collectRuns(const std::span<std::byte>& data) {
   std::vector<Run> runs;
@@ -253,7 +253,7 @@ void writeDeflatedFile(const std::span<std::byte>& data, const std::vector<NodeT
   std::filesystem::resize_file(std::filesystem::path(filename), outfileLength);
 }
 
-template <class NodeType, class PackedNodeType>
+template <class PackedNodeType>
 void inflateFile(const std::string& srcFilename, const std::string& dstFilename) {
   MappedFile srcMap(srcFilename, MappedFile::CreationDisposition::OPEN);
   if(srcMap.size() > std::numeric_limits<size_t>::max()) {
@@ -311,7 +311,7 @@ void inflateFile(const std::string& srcFilename, const std::string& dstFilename)
 }
 
 int main() {
-  using RLENode = BaseRLENode<uint8_t, uint8_t>;
+  using RLENode = PackedNode<uint8_t, uint8_t>;
   using PackedRLENode = BasePackedRLENode<RLENode::PrefixType, RLENode::LengthType>;
 
   std::cout << "Node size: " << sizeof(RLENode) << "\n";
@@ -330,7 +330,7 @@ int main() {
   auto runs = collectRuns(data);
   auto table = parseRuns<RLENode>(runs);
   writeDeflatedFile<RLENode, PackedRLENode>(data, table, deflated);
-  inflateFile<RLENode, PackedRLENode>(deflated, inflated);
+  inflateFile<PackedRLENode>(deflated, inflated);
 
   MappedFile infMap(inflated, MappedFile::CreationDisposition::OPEN);
   auto infData = infMap.getView(0, infMap.size());
