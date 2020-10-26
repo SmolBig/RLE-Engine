@@ -195,9 +195,46 @@ struct RLETable {
 };
 
 template <class NodeType>
+int64_t measureRunEfficiencyByFormat(const Run& run) {
+  uint64_t nodesGenerated = 0;
+
+  // account for skip nodes
+  if(run.prefix > NodeType::PrefixMax) {
+    constexpr uint64_t skipNodeMax = ((uint64_t)NodeType::PrefixMax << bitsizeof<uint8_t>()) | std::numeric_limits<uint8_t>::max();
+    uint64_t maxSkips  = run.prefix / skipNodeMax;
+    uint64_t remainder = run.prefix % skipNodeMax;
+    nodesGenerated += maxSkips;
+    if(remainder > NodeType::PrefixMax) { nodesGenerated++; }
+  }
+
+  // account for signal & long nodes
+  auto length = run.length;
+  if(length > NodeType::LengthMax) {
+    constexpr uint64_t longNodeMax = ((uint64_t)NodeType::LengthMax << bitsizeof<NodeType::PrefixType>()) | std::numeric_limits<NodeType::PrefixType>::max();
+    uint64_t maxLongs  = length / longNodeMax;
+    uint64_t remainder = length % longNodeMax;
+    nodesGenerated += maxLongs * 2;
+    length -= maxLongs * longNodeMax;
+    if(remainder > NodeType::LengthMax) {
+      nodesGenerated += 2;
+      length -= remainder;
+    }
+  }
+
+  // account for standard node
+  if(length > sizeof(NodeType)) {
+    nodesGenerated++;
+  }
+
+  return run.length - (nodesGenerated * sizeof(NodeType));
+}
+
+template <class NodeType>
 int64_t measureFormatEfficiency(const std::vector<Run>& runs) {
   int64_t efficiency = 0;
-  runs; //~~_
+  for(auto& run : runs) {
+    efficiency += measureRunEfficiencyByFormat<NodeType>(run);
+  }
   return efficiency;
 }
 
