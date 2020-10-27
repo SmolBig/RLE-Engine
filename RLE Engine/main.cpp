@@ -4,7 +4,10 @@
 #include <unordered_map>
 #include "MappedFile.h"
 
-#pragma warning(disable : 4458)
+
+//~~_ look for threading opportunities (format selection may be the only one?)
+//~~_ get a nice set of various test files going; make sure they test skip/long nodes (and combos)
+
 
 struct Run {
   uint64_t prefix; //number of preceeding non-run bytes
@@ -56,42 +59,46 @@ struct PackedNode {
   LengthT length;
   std::byte value;
 
-  void set(PrefixType prefix, LengthType length, std::byte value) {
-    this->prefix = prefix;
-    this->length = length;
-    this->value = value;
+  void set(PrefixType newPrefix, LengthType newLength, std::byte newValue) {
+    prefix = newPrefix;
+    length = newLength;
+    value  = newValue;
   }
 
   PackedNode() = default;
 
-  PackedNode(PrefixType prefix, LengthType length, std::byte value) {
-    set(prefix, length, value);
+  PackedNode(PrefixType prefix, LengthType length, std::byte value) :
+    prefix(prefix),
+    length(length),
+    value(value)
+  {
+    //nop
   }
 
-  uint64_t beSkipNode(uint64_t prefix) {
+  uint64_t beSkipNode(uint64_t totalPrefix) {
     constexpr uint64_t byteMax = std::numeric_limits<uint8_t>::max();
     constexpr uint64_t maxSkipLength = PrefixMax | (byteMax << bitsizeof<PrefixType>());
 
-    if(prefix < PrefixMax) {
+    if(totalPrefix < PrefixMax) {
       throw std::runtime_error("Tried to make a skip node when the prefix is not overloaded.");
     }
 
-    if(prefix > maxSkipLength) {
+    if(totalPrefix > maxSkipLength) {
       set(PrefixMax, 0, (std::byte)byteMax);
       return maxSkipLength;
     }
 
-    uint8_t hiBits = (uint8_t)(prefix >> bitsizeof<PrefixType>());
-    PrefixType loBits = (PrefixType)(prefix & PrefixMax);
+    uint8_t hiBits = (uint8_t)(totalPrefix >> bitsizeof<PrefixType>());
+    PrefixType loBits = (PrefixType)(totalPrefix & PrefixMax);
     set(loBits, 0, (std::byte)hiBits);
-    return prefix;
+    return totalPrefix;
   }
 
-  void beSignalNode(PrefixType prefix) {
-    set(prefix, 0, (std::byte)0);
+  void beSignalNode(PrefixType prefixSize) {
+    set(prefixSize, 0, (std::byte)0);
   }
 
-  uint64_t beLongNode(uint64_t longLength, std::byte value) {
+  uint64_t beLongNode(uint64_t longLength, std::byte runValue) {
     constexpr uint64_t maxLongLength = LengthMax | ((uint64_t)PrefixMax << bitsizeof<LengthType>());
 
     if(longLength < LengthMax) {
@@ -99,13 +106,13 @@ struct PackedNode {
     }
 
     if(longLength > maxLongLength) {
-      set(PrefixMax, LengthMax, value);
+      set(PrefixMax, LengthMax, runValue);
       return maxLongLength;
     }
 
     uint64_t loLength = longLength & LengthMax;
     uint64_t hiLength = longLength >> bitsizeof<LengthType>();
-    set((PrefixType)hiLength, (LengthType)loLength, value);
+    set((PrefixType)hiLength, (LengthType)loLength, runValue);
     return longLength;
   }
 
@@ -122,6 +129,8 @@ struct PackedNode {
   }
 };
 #pragma pack(pop)
+
+///////////////////////////////////////////////////////////////////////////////////////////
 
 template <class NodeType>
 void parseRun(const Run& run, std::vector<NodeType>& outVec) {
@@ -145,28 +154,6 @@ void parseRun(const Run& run, std::vector<NodeType>& outVec) {
   if(length > sizeof(NodeType)) {
     outVec.emplace_back((typename NodeType::PrefixType)prefix, (typename NodeType::LengthType)length, run.value);
   }
-}
-
-template <class NodeType>
-int64_t measureEfficiency(const std::vector<NodeType>& nodes) {
-  int64_t efficiency = 0;
-
-  bool longNode = false;
-  for(const auto& node : nodes) {
-    if(longNode) {
-      efficiency += node.getLongLength();
-      longNode = false;
-      continue;
-    }
-
-    longNode = node.length == 0 && (uint8_t)node.value == 0;
-
-    efficiency += node.length;
-  }
-
-  efficiency -= std::span(nodes).size_bytes();
-
-  return efficiency;
 }
 
 struct RLETable {
@@ -378,6 +365,8 @@ void deflateFile(const std::string& inputFilename, const std::string& outputFile
   }
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////
+
 template <class NodeType>
 std::vector<Run> extractTable(const void* data, size_t nodeCount) {
   std::vector<Run> outVec;
@@ -474,8 +463,34 @@ void inflateFile(const std::string& inputFilename, const std::string& outputFile
   }
 }
 
+///////////////////////////////////////////////////////////////////////////////////////////
+
+template <class NodeType>
+int64_t measureEfficiency(const std::vector<NodeType>& nodes) {
+  int64_t efficiency = 0;
+
+  bool longNode = false;
+  for(const auto& node : nodes) {
+    if(longNode) {
+      efficiency += node.getLongLength();
+      longNode = false;
+      continue;
+    }
+
+    longNode = node.length == 0 && (uint8_t)node.value == 0;
+
+    efficiency += node.length;
+  }
+
+  efficiency -= std::span(nodes).size_bytes();
+
+  return efficiency;
+}
+
+
 #include <filesystem>
 #include <iostream>
+#include <Windows.h>
 
 void primaryTest() {
   std::string testfile = "testfile.txt";
@@ -537,8 +552,6 @@ void efficiencyCalcTest() {
   if(c21 != m21) { __debugbreak(); }
   if(c22 != m22) { __debugbreak(); }
 }
-
-#include <Windows.h>
 
 int main() {
   efficiencyCalcTest();
