@@ -2,8 +2,6 @@
 #include <span>
 #include <string>
 
-//~~! modify getView to take allocation granularity into account (the span doesn't have to cover the whole view)
-
 /// class MappedFile
 /// Opens a file and memory maps it using the Win32 API.
 /// Provides an interface for generating views for the mapped file.

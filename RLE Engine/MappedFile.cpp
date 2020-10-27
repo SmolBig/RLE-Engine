@@ -85,11 +85,17 @@ MappedFile::View MappedFile::getView(uint64_t offset, size_t viewLength) {
     throw std::runtime_error("MappedFile cannot generate a View object with a length of zero.");
   }
 
+  SYSTEM_INFO sysInfo;
+  GetSystemInfo(&sysInfo);
+  auto& granularity = sysInfo.dwAllocationGranularity;
+  size_t grains  = offset / granularity;
+  size_t remains = offset % granularity;
+
   LARGE_INTEGER liOffset;
-  liOffset.QuadPart = offset;
+  liOffset.QuadPart = grains * granularity;
   void* ptr = MapViewOfFile(map, FILE_MAP_WRITE, liOffset.HighPart, liOffset.LowPart, viewLength);
   if(ptr == nullptr) { throwWindowsError(); }
-  return View(reinterpret_cast<std::byte*>(ptr), viewLength);
+  return View(reinterpret_cast<std::byte*>(ptr) + remains, viewLength);
 }
 
 MappedFile::View::View(std::byte* data, size_t length) :
