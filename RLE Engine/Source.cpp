@@ -69,8 +69,8 @@ struct PackedNode {
   }
 
   uint64_t beSkipNode(uint64_t prefix) {
-    constexpr uint8_t byteMax = (uint8_t)std::numeric_limits<uint8_t>::max();
-    constexpr uint64_t maxSkipLength = PrefixMax | (byteMax << bitsizeof(PrefixMax));
+    constexpr uint64_t byteMax = std::numeric_limits<uint8_t>::max();
+    constexpr uint64_t maxSkipLength = PrefixMax | (byteMax << bitsizeof<PrefixType>());
 
     if(prefix < PrefixMax) {
       throw std::runtime_error("Tried to make a skip node when the prefix is not overloaded.");
@@ -92,7 +92,7 @@ struct PackedNode {
   }
 
   uint64_t beLongNode(uint64_t longLength, std::byte value) {
-    constexpr uint64_t maxLongLength = LengthMax | (PrefixMax << bitsizeof(LengthMax));
+    constexpr uint64_t maxLongLength = LengthMax | ((uint64_t)PrefixMax << bitsizeof<LengthType>());
 
     if(longLength < LengthMax) {
       std::runtime_error("Tried to make a long node when the length is not overloaded.");
@@ -104,20 +104,20 @@ struct PackedNode {
     }
 
     uint64_t loLength = longLength & LengthMax;
-    uint64_t hiLength = longLength >> bitsizeof(LengthMax);
+    uint64_t hiLength = longLength >> bitsizeof<LengthType>();
     set((PrefixType)hiLength, (LengthType)loLength, value);
     return longLength;
   }
 
   uint64_t getLongLength() const {
     uint64_t loBits = length;
-    uint64_t hiBits = ((uint64_t)prefix) << bitsizeof(length);
+    uint64_t hiBits = ((uint64_t)prefix) << bitsizeof<LengthType>();
     return loBits | hiBits;
   }
 
   uint64_t getSkipLength() const {
     uint64_t loBits = prefix;
-    uint64_t hiBits = ((uint64_t)value) << bitsizeof(prefix);
+    uint64_t hiBits = ((uint64_t)value) << bitsizeof<PrefixType>();
     return loBits | hiBits;
   }
 };
@@ -141,13 +141,10 @@ void parseRun(const Run& run, std::vector<NodeType>& outVec) {
     length -= outVec.back().beLongNode(length, run.value);
   }
 
-  if(run.length <= sizeof(NodeType)) {
-    //do not push degenerate nodes
-    return;
+  //all values should be in range now, so push a standard node (if it's not degenerate)
+  if(length > sizeof(NodeType)) {
+    outVec.emplace_back((typename NodeType::PrefixType)prefix, (typename NodeType::LengthType)length, run.value);
   }
-
-  //all values should be in range now, so push a standard node
-  outVec.emplace_back((typename NodeType::PrefixType)prefix, (typename NodeType::LengthType)length, run.value);
 }
 
 template <class NodeType>
@@ -195,14 +192,16 @@ struct RLETable {
 };
 
 template <class NodeType>
-int64_t measureRunEfficiencyByFormat(const Run& run) {
+int64_t calculateRunEfficiencyByFormat(const Run& run) {
   uint64_t nodesGenerated = 0;
+  uint64_t lengthProcessed = 0;
 
   // account for skip nodes
   if(run.prefix > NodeType::PrefixMax) {
-    constexpr uint64_t skipNodeMax = ((uint64_t)NodeType::PrefixMax << bitsizeof<uint8_t>()) | std::numeric_limits<uint8_t>::max();
-    uint64_t maxSkips  = run.prefix / skipNodeMax;
-    uint64_t remainder = run.prefix % skipNodeMax;
+    constexpr uint64_t byteMax = std::numeric_limits<uint8_t>::max();
+    constexpr uint64_t maxSkipLength = NodeType::PrefixMax | (byteMax << bitsizeof<NodeType::PrefixType>());
+    uint64_t maxSkips  = run.prefix / maxSkipLength;
+    uint64_t remainder = run.prefix % maxSkipLength;
     nodesGenerated += maxSkips;
     if(remainder > NodeType::PrefixMax) { nodesGenerated++; }
   }
@@ -215,25 +214,28 @@ int64_t measureRunEfficiencyByFormat(const Run& run) {
     uint64_t remainder = length % longNodeMax;
     nodesGenerated += maxLongs * 2;
     length -= maxLongs * longNodeMax;
+    lengthProcessed += maxLongs * longNodeMax;
     if(remainder > NodeType::LengthMax) {
       nodesGenerated += 2;
       length -= remainder;
+      lengthProcessed += remainder;
     }
   }
 
   // account for standard node
   if(length > sizeof(NodeType)) {
     nodesGenerated++;
+    lengthProcessed += length;
   }
 
-  return run.length - (nodesGenerated * sizeof(NodeType));
+  return lengthProcessed - (nodesGenerated * sizeof(NodeType));
 }
 
 template <class NodeType>
-int64_t measureFormatEfficiency(const std::vector<Run>& runs) {
+int64_t calculateFormatEfficiency(const std::vector<Run>& runs) {
   int64_t efficiency = 0;
   for(auto& run : runs) {
-    efficiency += measureRunEfficiencyByFormat<NodeType>(run);
+    efficiency += calculateRunEfficiencyByFormat<NodeType>(run);
   }
   return efficiency;
 }
@@ -245,10 +247,10 @@ using Node16x16 = PackedNode<uint16_t, uint16_t>;
 
 std::pair<NodeFormat, int64_t> selectFormat(const std::vector<Run>& runs) {
   std::unordered_map<NodeFormat, int64_t> efficiencies{
-    { NodeFormat::P8L8,   measureFormatEfficiency<Node8x8>(runs) },
-    { NodeFormat::P8L16,  measureFormatEfficiency<Node8x16>(runs) },
-    { NodeFormat::P16L8,  measureFormatEfficiency<Node16x8>(runs) },
-    { NodeFormat::P16L16, measureFormatEfficiency<Node16x16>(runs) }
+    { NodeFormat::P8L8,   calculateFormatEfficiency<Node8x8>(runs)   },
+    { NodeFormat::P8L16,  calculateFormatEfficiency<Node8x16>(runs)  },
+    { NodeFormat::P16L8,  calculateFormatEfficiency<Node16x8>(runs)  },
+    { NodeFormat::P16L16, calculateFormatEfficiency<Node16x16>(runs) }
   };
 
   int64_t bestEfficiency = 0;
@@ -281,9 +283,7 @@ void deflateData(MappedFile::View& inView, MappedFile::View& outView) {
   std::span<const NodeType> nodes(nodesPtr, header->tableNodeCount);
 
   auto inIter = inView.begin();
-  auto outIter = outView.begin();
-  outIter += sizeof(Header);
-  outIter += nodes.size_bytes();
+  auto outIter = outView.begin() + sizeof(Header) + nodes.size_bytes();
 
   bool longNode = false;
   for(auto& node : nodes) {
@@ -303,10 +303,10 @@ void deflateData(MappedFile::View& inView, MappedFile::View& outView) {
       }
     }
 
-    auto tailIter = inIter + prefix;
-    outIter = std::copy(inIter, tailIter, outIter);
-    //tailIter is past the prefix, add the run length to that to get the new srcIter
-    inIter = tailIter + node.length;
+    auto inTail = inIter + prefix;
+    outIter = std::copy(inIter, inTail, outIter);
+    //tailIter is past the prefix, add the run length to that to get the new inIter
+    inIter = inTail + node.length;
   }
 
   std::copy(inIter, inView.end(), outIter);
@@ -357,7 +357,7 @@ void deflateFile(const std::string& inputFilename, const std::string& outputFile
     return;
   };
 
-  uint64_t compressedLength = inMap.size() - table.efficiency;
+  uint64_t compressedLength = inMap.size() - table.efficiency + sizeof(Header);
   MappedFile outMap(outputFilename, MappedFile::CreationDisposition::CREATE, compressedLength);
   auto outView = outMap.getView(0, outMap.size());
 
@@ -435,29 +435,27 @@ std::vector<Run> extractTableByFormat(const void* data, size_t nodeCount, NodeFo
 
 void inflateFile(const std::string& inputFilename, const std::string& outputFilename) {
   auto inMap = MappedFile(inputFilename, MappedFile::CreationDisposition::OPEN);
-  auto headerView = inMap.getView(0, sizeof(Header));
+  auto inView = inMap.getView(0, inMap.size());
+  auto inIter = inView.begin();
 
-  const Header* header = reinterpret_cast<Header*>(headerView.data());
+  const Header* header = reinterpret_cast<Header*>(inView.data());
+  inIter += sizeof(Header);
   auto format = header->checkMagic();
   size_t nodeSize = 0;
   switch(format) {
-  case NodeFormat::P8L8:   nodeSize *= sizeof(Node8x8);   break;
-  case NodeFormat::P8L16:  nodeSize *= sizeof(Node8x16);  break;
-  case NodeFormat::P16L8:  nodeSize *= sizeof(Node16x8);  break;
-  case NodeFormat::P16L16: nodeSize *= sizeof(Node16x16); break;
+  case NodeFormat::P8L8:   nodeSize = sizeof(Node8x8);   break;
+  case NodeFormat::P8L16:  nodeSize = sizeof(Node8x16);  break;
+  case NodeFormat::P16L8:  nodeSize = sizeof(Node16x8);  break;
+  case NodeFormat::P16L16: nodeSize = sizeof(Node16x16); break;
   }
   
   size_t tableByteSize = header->tableNodeCount * nodeSize;
-  auto tableView = inMap.getView(sizeof(Header), tableByteSize);
-  auto table = extractTableByFormat(tableView.data(), header->tableNodeCount, format);
-
-  size_t bytesSoFar = sizeof(Header) - tableByteSize;
-  auto dataView = inMap.getView(bytesSoFar, inMap.size() - bytesSoFar);
+  auto table = extractTableByFormat(inView.data() + sizeof(Header), header->tableNodeCount, format);
+  inIter += tableByteSize;
 
   auto outMap = MappedFile(outputFilename, MappedFile::CreationDisposition::CREATE, header->decompressedLength);
   auto outView = outMap.getView(0, outMap.size());
 
-  auto inIter = dataView.begin();
   auto outIter = outView.begin();
 
   for(auto& node : table) {
@@ -470,7 +468,7 @@ void inflateFile(const std::string& inputFilename, const std::string& outputFile
     outIter = outTail;
   }
   
-  outIter = std::copy(inIter, dataView.end(), outIter);
+  outIter = std::copy(inIter, inView.end(), outIter);
   if(outIter != outView.end()) {
     throw std::runtime_error("Inflated file does not match expected length.");
   }
@@ -479,7 +477,7 @@ void inflateFile(const std::string& inputFilename, const std::string& outputFile
 #include <filesystem>
 #include <iostream>
 
-int main() {
+void primaryTest() {
   std::string testfile = "testfile.txt";
   std::string deflated = testfile + ".rle";
   std::string inflated = "reinflated.txt";
@@ -490,15 +488,67 @@ int main() {
   deflateFile(testfile, deflated);
   inflateFile(deflated, inflated);
 
-  MappedFile infMap(inflated, MappedFile::CreationDisposition::OPEN);
-  auto infData = infMap.getView(0, infMap.size());
-  MappedFile defMap(deflated, MappedFile::CreationDisposition::OPEN);
-  auto defData = defMap.getView(0, defMap.size());
+  MappedFile testMap(testfile, MappedFile::CreationDisposition::OPEN);
+  auto infData = testMap.getView(0, testMap.size());
+  MappedFile reinfMap(inflated, MappedFile::CreationDisposition::OPEN);
+  auto defData = reinfMap.getView(0, reinfMap.size());
   std::cout << "Equality Test: " << (std::equal(infData.begin(), infData.end(), defData.begin(), defData.end()) ? "Pass" : "Fail") << "\n";
-  auto compression = (float)((defMap.size() * 10000) / infMap.size()) / 100;
+  auto deflatedSize = std::filesystem::file_size(std::filesystem::path(deflated));
+  auto compression = (float)((deflatedSize * 10000) / testMap.size()) / 100;
   std::cout << "Compressed Length Percentage: " << compression << "\n";
   std::cout << std::endl;
 
   system("pause");
 
 }
+
+void efficiencyCalcTest() {
+  std::vector<Run> runs;
+  {
+    MappedFile inMap("testfile.txt", MappedFile::CreationDisposition::OPEN);
+    auto inView = inMap.getView(0, inMap.size());
+    runs = collectRuns(inView);
+  }
+
+  auto c11 = calculateFormatEfficiency<Node8x8>(runs);
+  auto c12 = calculateFormatEfficiency<Node8x16>(runs);
+  auto c21 = calculateFormatEfficiency<Node16x8>(runs);
+  auto c22 = calculateFormatEfficiency<Node16x16>(runs);
+
+  std::vector<Node8x8> nodes11;
+  std::vector<Node8x16> nodes12;
+  std::vector<Node16x8> nodes21;
+  std::vector<Node16x16> nodes22;
+
+  for(auto& run : runs) {
+    parseRun(run, nodes11);
+    parseRun(run, nodes12);
+    parseRun(run, nodes21);
+    parseRun(run, nodes22);
+  }
+
+  int64_t m11 = measureEfficiency(nodes11);
+  int64_t m12 = measureEfficiency(nodes12);
+  int64_t m21 = measureEfficiency(nodes21);
+  int64_t m22 = measureEfficiency(nodes22);
+
+  if(c11 != m11) { __debugbreak(); }
+  if(c12 != m12) { __debugbreak(); }
+  if(c21 != m21) { __debugbreak(); }
+  if(c22 != m22) { __debugbreak(); }
+}
+
+#include <Windows.h>
+
+int main() {
+  efficiencyCalcTest();
+  primaryTest();
+}
+
+
+
+
+
+
+
+
