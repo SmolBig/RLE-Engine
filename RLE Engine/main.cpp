@@ -1,19 +1,49 @@
-#include <iostream>
-#include <string>
 #include <vector>
 #include <limits>
-#include <filesystem>
+#include <stdexcept>
+#include <unordered_map>
 #include "MappedFile.h"
 
-/*~~_ implement system to determine most efficient node type based on runs vector
- * - run parseRuns for each available type
- * - once it works, thread the tests
- * - return the best table and it's NodeType
- * - modify the inflate routine to make use of the header-specified NodeType
- * - apply the modification to the deflation routine
- */
+#pragma warning(disable : 4458)
 
-//~~_ get a nice set of various test files going; make sure they test skip/long nodes (and combos)
+struct Run {
+  uint64_t prefix; //number of preceeding non-run bytes
+  uint64_t length;
+  std::byte value;
+};
+
+template<class T>
+constexpr size_t bitsizeof(T = T{}) {
+  constexpr size_t BITS_PER_BYTE = 8;
+  return sizeof(T) * BITS_PER_BYTE;
+}
+
+enum class NodeFormat {
+  P8L8   = 0x11,
+  P8L16  = 0x12,
+  P16L8  = 0x21,
+  P16L16 = 0x22,
+  INEFFICIENT
+};
+
+#pragma pack(push, 1)
+struct Header {
+  char magic[4] = "RLE";
+  uint64_t decompressedLength = 0;
+  uint32_t tableNodeCount = 0;
+
+  void setNodeFormat(NodeFormat format) {
+    magic[3] = (char)format;
+  }
+
+  NodeFormat checkMagic() const {
+    static const std::string EXPECT = "RLE";
+    if(!std::equal(EXPECT.begin(), EXPECT.end(), std::span(magic).begin())) {
+      throw std::runtime_error("Attempted to reinflate a non RLE file.");
+    }
+    return (NodeFormat)magic[3];
+  }
+};
 
 template <typename PrefixT, typename LengthT>
 struct PackedNode {
@@ -22,56 +52,268 @@ struct PackedNode {
   using LengthType = LengthT;
   static constexpr size_t LengthMax = std::numeric_limits<LengthType>::max();
 
-  PrefixType prefix; //number of preceeding non-run bytes
-  LengthType length;
-  std::byte value;
-
-  //~~@ add functions to make special node types
-};
-
-using Run = PackedNode<uint64_t, uint64_t>;
-
-#pragma pack(push, 1)
-template <typename PrefixT, typename LengthT>
-struct BasePackedRLENode {
   PrefixT prefix;
   LengthT length;
   std::byte value;
-};
-#pragma pack(pop)
 
-template<class T>
-constexpr size_t bitsizeof(T = T{}) {
-  constexpr size_t BITS_PER_BYTE = 8;
-  return sizeof(T) * BITS_PER_BYTE;
-}
+  void set(PrefixType prefix, LengthType length, std::byte value) {
+    this->prefix = prefix;
+    this->length = length;
+    this->value = value;
+  }
 
-#pragma pack(push, 1)
-struct Header {
-  char magic[4] = "RLE";
-  uint64_t decompressedLength = 0;
-  uint32_t tableNodeCount = 0;
+  PackedNode() = default;
 
-  enum class NodeFormat {
-    P8L8   = 0x11,
-    P8L16  = 0x12,
-    P16L8  = 0x21,
-    P16L16 = 0x22,
-  };
+  PackedNode(PrefixType prefix, LengthType length, std::byte value) {
+    set(prefix, length, value);
+  }
 
-  NodeFormat checkMagic() {
-    static const std::string EXPECT = "RLE";
-    if(!std::equal(EXPECT.begin(), EXPECT.end(), std::span(magic).begin())) {
-      throw std::runtime_error("Attempted to decompress a non RLE file.");
+  uint64_t beSkipNode(uint64_t prefix) {
+    constexpr uint64_t byteMax = std::numeric_limits<uint8_t>::max();
+    constexpr uint64_t maxSkipLength = PrefixMax | (byteMax << bitsizeof<PrefixType>());
+
+    if(prefix < PrefixMax) {
+      throw std::runtime_error("Tried to make a skip node when the prefix is not overloaded.");
     }
-    return (NodeFormat)magic[3];
+
+    if(prefix > maxSkipLength) {
+      set(PrefixMax, 0, (std::byte)byteMax);
+      return maxSkipLength;
+    }
+
+    uint8_t hiBits = (uint8_t)(prefix >> bitsizeof<PrefixType>());
+    PrefixType loBits = (PrefixType)(prefix & PrefixMax);
+    set(loBits, 0, (std::byte)hiBits);
+    return prefix;
+  }
+
+  void beSignalNode(PrefixType prefix) {
+    set(prefix, 0, (std::byte)0);
+  }
+
+  uint64_t beLongNode(uint64_t longLength, std::byte value) {
+    constexpr uint64_t maxLongLength = LengthMax | ((uint64_t)PrefixMax << bitsizeof<LengthType>());
+
+    if(longLength < LengthMax) {
+      std::runtime_error("Tried to make a long node when the length is not overloaded.");
+    }
+
+    if(longLength > maxLongLength) {
+      set(PrefixMax, LengthMax, value);
+      return maxLongLength;
+    }
+
+    uint64_t loLength = longLength & LengthMax;
+    uint64_t hiLength = longLength >> bitsizeof<LengthType>();
+    set((PrefixType)hiLength, (LengthType)loLength, value);
+    return longLength;
+  }
+
+  uint64_t getLongLength() const {
+    uint64_t loBits = length;
+    uint64_t hiBits = ((uint64_t)prefix) << bitsizeof<LengthType>();
+    return loBits | hiBits;
+  }
+
+  uint64_t getSkipLength() const {
+    uint64_t loBits = prefix;
+    uint64_t hiBits = ((uint64_t)value) << bitsizeof<PrefixType>();
+    return loBits | hiBits;
   }
 };
 #pragma pack(pop)
 
+template <class NodeType>
+void parseRun(const Run& run, std::vector<NodeType>& outVec) {
+  //push skip nodes until prefix is within range
+  uint64_t prefix = run.prefix;
+  while(prefix > NodeType::PrefixMax) {
+    outVec.emplace_back();
+    prefix -= outVec.back().beSkipNode(prefix);
+  }
+
+  //push long nodes until length is within range
+  uint64_t length = run.length;
+  while(length > NodeType::LengthMax) {
+    outVec.emplace_back();
+    outVec.back().beSignalNode((uint8_t)prefix);
+    outVec.emplace_back();
+    length -= outVec.back().beLongNode(length, run.value);
+  }
+
+  //all values should be in range now, so push a standard node (if it's not degenerate)
+  if(length > sizeof(NodeType)) {
+    outVec.emplace_back((typename NodeType::PrefixType)prefix, (typename NodeType::LengthType)length, run.value);
+  }
+}
+
+template <class NodeType>
+int64_t measureEfficiency(const std::vector<NodeType>& nodes) {
+  int64_t efficiency = 0;
+
+  bool longNode = false;
+  for(const auto& node : nodes) {
+    if(longNode) {
+      efficiency += node.getLongLength();
+      longNode = false;
+      continue;
+    }
+
+    longNode = node.length == 0 && (uint8_t)node.value == 0;
+
+    efficiency += node.length;
+  }
+
+  efficiency -= std::span(nodes).size_bytes();
+
+  return efficiency;
+}
+
+struct RLETable {
+  RLETable() = default;
+
+  template <class NodeType>
+  RLETable(NodeFormat format, int64_t efficiency, const std::vector<NodeType>& nodes) : 
+    format(format),
+    efficiency(efficiency),
+    nodeCount((uint32_t)nodes.size())
+  {
+    if(nodes.size() > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error("RLE table too large.");
+    }
+    std::span<const std::byte> span(reinterpret_cast<const std::byte*>(nodes.data()), std::span(nodes).size_bytes());
+    nodesAsBytes.insert(nodesAsBytes.begin(), span.begin(), span.end());
+  }
+
+  NodeFormat format;
+  int64_t efficiency;
+  uint32_t nodeCount;
+  std::vector<std::byte> nodesAsBytes;
+};
+
+template <class NodeType>
+int64_t calculateRunEfficiencyByFormat(const Run& run) {
+  uint64_t nodesGenerated = 0;
+  uint64_t lengthProcessed = 0;
+
+  // account for skip nodes
+  if(run.prefix > NodeType::PrefixMax) {
+    constexpr uint64_t byteMax = std::numeric_limits<uint8_t>::max();
+    constexpr uint64_t maxSkipLength = NodeType::PrefixMax | (byteMax << bitsizeof<NodeType::PrefixType>());
+    uint64_t maxSkips  = run.prefix / maxSkipLength;
+    uint64_t remainder = run.prefix % maxSkipLength;
+    nodesGenerated += maxSkips;
+    if(remainder > NodeType::PrefixMax) { nodesGenerated++; }
+  }
+
+  // account for signal & long nodes
+  auto length = run.length;
+  if(length > NodeType::LengthMax) {
+    constexpr uint64_t longNodeMax = ((uint64_t)NodeType::LengthMax << bitsizeof<NodeType::PrefixType>()) | std::numeric_limits<NodeType::PrefixType>::max();
+    uint64_t maxLongs  = length / longNodeMax;
+    uint64_t remainder = length % longNodeMax;
+    nodesGenerated += maxLongs * 2;
+    length -= maxLongs * longNodeMax;
+    lengthProcessed += maxLongs * longNodeMax;
+    if(remainder > NodeType::LengthMax) {
+      nodesGenerated += 2;
+      length -= remainder;
+      lengthProcessed += remainder;
+    }
+  }
+
+  // account for standard node
+  if(length > sizeof(NodeType)) {
+    nodesGenerated++;
+    lengthProcessed += length;
+  }
+
+  return lengthProcessed - (nodesGenerated * sizeof(NodeType));
+}
+
+template <class NodeType>
+int64_t calculateFormatEfficiency(const std::vector<Run>& runs) {
+  int64_t efficiency = 0;
+  for(auto& run : runs) {
+    efficiency += calculateRunEfficiencyByFormat<NodeType>(run);
+  }
+  return efficiency;
+}
+
+using Node8x8   = PackedNode<uint8_t,  uint8_t>;
+using Node8x16  = PackedNode<uint8_t,  uint16_t>;
+using Node16x8  = PackedNode<uint16_t, uint8_t>;
+using Node16x16 = PackedNode<uint16_t, uint16_t>;
+
+std::pair<NodeFormat, int64_t> selectFormat(const std::vector<Run>& runs) {
+  std::unordered_map<NodeFormat, int64_t> efficiencies{
+    { NodeFormat::P8L8,   calculateFormatEfficiency<Node8x8>(runs)   },
+    { NodeFormat::P8L16,  calculateFormatEfficiency<Node8x16>(runs)  },
+    { NodeFormat::P16L8,  calculateFormatEfficiency<Node16x8>(runs)  },
+    { NodeFormat::P16L16, calculateFormatEfficiency<Node16x16>(runs) }
+  };
+
+  int64_t bestEfficiency = 0;
+  NodeFormat bestFormat = NodeFormat::INEFFICIENT;
+  for(auto p : efficiencies) {
+    if(p.second > bestEfficiency) {
+      bestEfficiency = p.second;
+      bestFormat = p.first;
+    }
+  }
+
+  return std::make_pair(bestFormat, bestEfficiency);
+}
+
+template <class NodeType>
+RLETable generateRLETable(NodeFormat format, int64_t efficiency, const std::vector<Run>& runs) {
+  std::vector<NodeType> nodes;
+  for(auto& run : runs) { parseRun(run, nodes); }
+  return RLETable(format, efficiency, nodes);
+}
+
+void reject() {
+  throw std::runtime_error("Cannot deflate this file efficiently. Reject it. (Rejection not yet implemented.)");
+}
+
+template <class NodeType>
+void deflateData(MappedFile::View& inView, MappedFile::View& outView) {
+  Header* header = reinterpret_cast<Header*>(outView.data());
+  const NodeType* nodesPtr = reinterpret_cast<const NodeType*>(outView.data() + sizeof(Header));
+  std::span<const NodeType> nodes(nodesPtr, header->tableNodeCount);
+
+  auto inIter = inView.begin();
+  auto outIter = outView.begin() + sizeof(Header) + nodes.size_bytes();
+
+  bool longNode = false;
+  for(auto& node : nodes) {
+    if(longNode) {
+      inIter += node.getLongLength();
+      longNode = false;
+      continue;
+    }
+
+    size_t prefix = node.prefix;
+    if(node.length == 0) {
+      if(node.value == (std::byte)0) {
+        longNode = true;
+      }
+      else {
+        prefix = node.getSkipLength();
+      }
+    }
+
+    auto inTail = inIter + prefix;
+    outIter = std::copy(inIter, inTail, outIter);
+    //tailIter is past the prefix, add the run length to that to get the new inIter
+    inIter = inTail + node.length;
+  }
+
+  std::copy(inIter, inView.end(), outIter);
+}
+
 std::vector<Run> collectRuns(const std::span<std::byte>& data) {
   std::vector<Run> runs;
-  runs.reserve(100);
 
   Run run;
   size_t prevTailPos = 0;
@@ -84,7 +326,7 @@ std::vector<Run> collectRuns(const std::span<std::byte>& data) {
       run.length++;
     }
 
-    if(run.length > sizeof(BasePackedRLENode<uint8_t, uint8_t>)) {
+    if(run.length > sizeof(Node8x8)) {
       run.prefix = position - prevTailPos;
       runs.push_back(run);
       prevTailPos = position + run.length;
@@ -94,254 +336,219 @@ std::vector<Run> collectRuns(const std::span<std::byte>& data) {
   return runs;
 }
 
+void deflateFile(const std::string& inputFilename, const std::string& outputFilename) {
+  MappedFile inMap(inputFilename, MappedFile::CreationDisposition::OPEN);
+  auto inView = inMap.getView(0, inMap.size());
+
+  std::vector<Run> runs = collectRuns(inView);
+
+  auto selection = selectFormat(runs);
+  auto format = selection.first;
+  auto efficiency = selection.second;
+
+  RLETable table;
+  switch(format) {
+  case NodeFormat::P8L8:   table = generateRLETable<Node8x8  >(format, efficiency, runs); break;
+  case NodeFormat::P8L16:  table = generateRLETable<Node8x16 >(format, efficiency, runs); break;
+  case NodeFormat::P16L8:  table = generateRLETable<Node16x8 >(format, efficiency, runs); break;
+  case NodeFormat::P16L16: table = generateRLETable<Node16x16>(format, efficiency, runs); break;
+  case NodeFormat::INEFFICIENT:
+    reject();
+    return;
+  };
+
+  uint64_t compressedLength = inMap.size() - table.efficiency + sizeof(Header);
+  MappedFile outMap(outputFilename, MappedFile::CreationDisposition::CREATE, compressedLength);
+  auto outView = outMap.getView(0, outMap.size());
+
+  Header* header = new(outView.data()) Header;
+  header->setNodeFormat(format);
+  header->decompressedLength = inMap.size();
+  header->tableNodeCount = table.nodeCount;
+
+  auto outIter = outView.begin() + sizeof(Header);
+  std::copy(table.nodesAsBytes.begin(), table.nodesAsBytes.end(), outIter);
+
+  switch(format) {
+  case NodeFormat::P8L8:   deflateData<Node8x8  >(inView, outView); break;
+  case NodeFormat::P8L16:  deflateData<Node8x16 >(inView, outView); break;
+  case NodeFormat::P16L8:  deflateData<Node16x8 >(inView, outView); break;
+  case NodeFormat::P16L16: deflateData<Node16x16>(inView, outView); break;
+  default: throw std::logic_error("Failed switch to format.");
+  }
+}
+
 template <class NodeType>
-constexpr size_t lengthFromLongNode(const NodeType& node) {
-  size_t retval = node.prefix;
-  retval <<= bitsizeof<NodeType::LengthType>();
-  retval += node.length;
-  return retval;
-}
+std::vector<Run> extractTable(const void* data, size_t nodeCount) {
+  std::vector<Run> outVec;
+  outVec.reserve(nodeCount);
 
-template <class NodeType>
-NodeType makeLongNode(size_t length, std::byte value) {
-  size_t loLength = length & NodeType::LengthMax;
-  size_t hiLength = length >> bitsizeof<NodeType::LengthType>();
-  return NodeType{ (typename NodeType::PrefixType)hiLength, (typename NodeType::LengthType)loLength, value };
-}
+  std::span<const NodeType> nodes(reinterpret_cast<const NodeType*>(data), nodeCount);
 
-template <class NodeType>
-std::vector<NodeType> parseRuns(const std::vector<Run>& runs) {
-  std::vector<NodeType> table;
-  table.reserve(100);
+  Run run{};
+  for(auto iter = nodes.begin(); iter != nodes.end(); iter++) {
+    if(iter->length == 0) {
+      if(iter->value == (std::byte)0) { //signal&long node
+        run.prefix += iter->prefix;
+        iter++;
+        run.length = iter->getLongLength();
+        run.value = iter->value;
 
-  for(auto& run : runs) {
-    //Ensure that prefix is short enough for PrefixType
-    //zero-length node with non-zero value represents "advance tail by N" where N is an
-    //  unsigned integer with prefix as low bits and value as high bits.
-    uint64_t prefix = run.prefix;
-    constexpr size_t maxSkipLength = (NodeType::PrefixMax << bitsizeof<uint8_t>()) | std::numeric_limits<uint8_t>::max();
-    while(prefix > maxSkipLength) {
-      table.push_back({ NodeType::PrefixMax, 0, (std::byte)std::numeric_limits<uint8_t>::max() });
-      prefix -= maxSkipLength;
-    }
-    if(prefix > NodeType::PrefixMax) {
-      uint64_t loBits = prefix & NodeType::PrefixMax;
-      typename NodeType::PrefixType tmpPrefix = (typename NodeType::PrefixType)loBits;
-      uint64_t hiBits = prefix >> bitsizeof<uint8_t>();
-      std::byte tmpValue = (std::byte)hiBits;
-      table.push_back({ tmpPrefix, 0, tmpValue });
-      prefix = 0;
-    }
+        outVec.push_back(run);
+        run.prefix = 0;
+        run.length = 0;
+        run.value = (std::byte)0;
 
-    //Ensure that length is short enough for LengthType
-    size_t length = run.length;
-    if(length > NodeType::LengthMax) {
-      constexpr size_t LONG_NODE_MAX_LENGTH = lengthFromLongNode(NodeType{ NodeType::PrefixMax, NodeType::LengthMax, (std::byte)0 });
-
-      //push maxxed-out "long nodes" until length is less than long node max
-      while(length > LONG_NODE_MAX_LENGTH) {
-        table.push_back({ (typename NodeType::PrefixType)prefix, 0, (std::byte)0 });
-        prefix = 0;
-        table.push_back({ NodeType::PrefixMax, NodeType::LengthMax, run.value });
-        length -= LONG_NODE_MAX_LENGTH;
-      }
-      //if remaining length is still too large for a standard node then push a long node
-      if(length > NodeType::LengthMax) {
-        table.push_back({ (typename NodeType::PrefixType)prefix, 0, (std::byte)0 });
-        prefix = 0;
-        table.push_back(makeLongNode<NodeType>(length, run.value));
-        length = 0; //in this case the long node will cover all remaining length
-      }
-    }
-    //if length remains then push a standard node
-    if(length) {
-      table.push_back({ (typename NodeType::PrefixType)prefix, (typename NodeType::LengthType)length, run.value });
-    }
-  }
-
-  return table;
-}
-
-template <class NodeType, class PackedNodeType>
-int64_t checkTableBytesSaved(const std::vector<NodeType>& table) {
-  size_t tableLength = table.size() * sizeof(PackedNodeType);
-  size_t totalRunsLength = 0;
-  for(auto& node : table) { totalRunsLength += node.length; }
-  return totalRunsLength - tableLength;
-}
-
-template <class NodeType, class PackedNodeType>
-size_t packTable(const std::vector<NodeType>& unpackedTable, std::span<std::byte> target) {
-  size_t packedTableSize = unpackedTable.size() * sizeof(PackedNodeType);
-  if(target.size() < packedTableSize) {
-    throw std::runtime_error("Target span too short to fit packed table.");
-  }
-
-  std::span<PackedNodeType> packSpan(reinterpret_cast<PackedNodeType*>(target.data()), unpackedTable.size());
-  auto iter = packSpan.begin();
-  for(auto& node : unpackedTable) {
-    iter->prefix = node.prefix;
-    iter->length = node.length;
-    iter->value = node.value;
-    ++iter;
-  }
-
-  return packedTableSize;
-}
-
-template <class PackedNodeContainer>
-std::vector<Run> unpackTable(const PackedNodeContainer& packedTable) {
-  std::vector<Run> unpackedTable;
-  unpackedTable.reserve(packedTable.size());
-  for(auto& node : packedTable) {
-    unpackedTable.push_back({ node.prefix, node.length, node.value });
-  }
-  return unpackedTable;
-}
-
-template <class NodeType, class PackedNodeType>
-void writeDeflatedFile(const std::span<std::byte>& data, const std::vector<NodeType>& table, const std::string& filename) {
-  if(table.size() > std::numeric_limits<uint32_t>::max()) { throw std::runtime_error("Table size too large."); }
-
-  size_t outfileLength = 0; //~~@ NodeType system should allow outfile length to be predicted
-
-  { //~~@ until NodeType sys is in place, we assume the compressed file is shorter than the decompressed one and we clip the difference after compression
-    MappedFile map(filename, MappedFile::CreationDisposition::CREATE, data.size());
-    auto view = map.getView(0, map.size());
-    auto dstIter = view.begin();
-
-    Header* header = new(view.data()) Header;
-    header->magic[3] = 0x11; //~~@ determine best node type to use and indicate it here
-    header->decompressedLength = (uint32_t)data.size();
-    header->tableNodeCount = (uint32_t)table.size();
-    dstIter += sizeof(Header);
-
-    dstIter += packTable<NodeType, PackedNodeType>(table, std::span<std::byte>(dstIter, view.end()));
-
-    //begin writing deflated data
-    auto srcIter = data.begin();
-    bool longNode = false;
-    for(auto& node : table) {
-      if(longNode) {
-        //move head past run (no prefix on long nodes)
-        srcIter += lengthFromLongNode(node);
-        longNode = false;
         continue;
       }
-
-      size_t prefixLength = node.prefix;
-      if(node.length == 0) {
-        if(node.value == (std::byte)0) {
-          longNode = true;
-        }
-        else {
-          prefixLength |= (size_t)node.value << bitsizeof(node.prefix);
-        }
+      else { //skip node
+        run.prefix += iter->getSkipLength();
+        continue;
       }
-      auto tailIter = srcIter + prefixLength;
-      dstIter = std::copy(srcIter, tailIter, dstIter);
-      //tailIter is past the prefix, add the run length to that to get the new srcIter
-      srcIter = tailIter + node.length;
     }
 
-    //copy the remaining bytes and calculate the length of the compressed file
-    dstIter = std::copy(srcIter, data.end(), dstIter);
-    outfileLength = dstIter - view.begin();
+    //standard
+    run.prefix += iter->prefix;
+    run.length = iter->length;
+    run.value = iter->value;
+
+    outVec.push_back(run);
+    run.prefix = 0;
+    run.length = 0;
+    run.value = (std::byte)0;
   }
 
-  //clip file length
-  std::filesystem::resize_file(std::filesystem::path(filename), outfileLength);
+  return outVec;
 }
 
-template <class PackedNodeType>
-void inflateFile(const std::string& srcFilename, const std::string& dstFilename) {
-  MappedFile srcMap(srcFilename, MappedFile::CreationDisposition::OPEN);
-  if(srcMap.size() > std::numeric_limits<size_t>::max()) {
-    //~~_ use rolling view to accomodate this instead of throwing
-    throw std::runtime_error("File too large to unpack. (large file support not yet implemented)");
-  }
-  auto srcView = srcMap.getView(0, srcMap.size());
-  auto srcIter = srcView.begin();
+std::vector<Run> extractTableByFormat(const void* data, size_t nodeCount, NodeFormat format) {
+  std::vector<Run> outVec;
+  switch(format) {
+  case NodeFormat::P8L8:   return extractTable<Node8x8  >(data, nodeCount);
+  case NodeFormat::P8L16:  return extractTable<Node8x16 >(data, nodeCount);
+  case NodeFormat::P16L8:  return extractTable<Node16x8 >(data, nodeCount);
+  case NodeFormat::P16L16: return extractTable<Node16x16>(data, nodeCount);
+  };
 
-  Header* headerPtr = reinterpret_cast<Header*>(&srcView[0]);
-  srcIter += sizeof(Header);
-  headerPtr->checkMagic(); //~~_ return value is node type, which should be caught and used
-
-  PackedNodeType* firstNodePtr = reinterpret_cast<PackedNodeType*>(&srcView[sizeof(Header)]);
-  std::span<PackedNodeType> packedTable(firstNodePtr, headerPtr->tableNodeCount);
-  auto table = unpackTable(packedTable);
-  srcIter += sizeof(PackedNodeType) * headerPtr->tableNodeCount;
-
-  MappedFile dstMap(dstFilename, MappedFile::CreationDisposition::CREATE, headerPtr->decompressedLength);
-  auto dstView = dstMap.getView(0, dstMap.size());
-  auto dstIter = dstView.begin();
-
-  bool longNode = false;
-  for(const auto& node : table) {
-    if(longNode) {
-      size_t longLength = lengthFromLongNode(node);
-      auto tail = dstIter + longLength;
-      std::fill(dstIter, tail, node.value);
-      dstIter = tail;
-      longNode = false;
-      continue;
-    }
-
-    size_t bytesToCopy = node.prefix;
-    if(node.length == 0) {
-      if(node.value == (std::byte)0) {
-        longNode = true;
-      }
-      else {
-        bytesToCopy |= (size_t)node.value << bitsizeof(packedTable[0].prefix);
-      }
-    }
-
-    auto srcTail = srcIter + bytesToCopy;
-    std::copy(srcIter, srcTail, dstIter);
-    srcIter = srcTail;
-    dstIter += bytesToCopy;
-
-    auto dstTail = dstIter + node.length;
-    std::fill(dstIter, dstTail, node.value);
-    dstIter = dstTail;
-  }
-
-  std::copy(srcIter, srcView.end(), dstIter);
+  throw std::logic_error("Failed to switch by format type.");
 }
 
-int main() {
-  using RLENode = PackedNode<uint8_t, uint8_t>;
-  using PackedRLENode = BasePackedRLENode<RLENode::PrefixType, RLENode::LengthType>;
+void inflateFile(const std::string& inputFilename, const std::string& outputFilename) {
+  auto inMap = MappedFile(inputFilename, MappedFile::CreationDisposition::OPEN);
+  auto inView = inMap.getView(0, inMap.size());
+  auto inIter = inView.begin();
 
-  std::cout << "Node size: " << sizeof(RLENode) << "\n";
-  std::cout << "Packed Node size: " << sizeof(PackedRLENode) << "\n\n";
+  const Header* header = reinterpret_cast<Header*>(inView.data());
+  inIter += sizeof(Header);
+  auto format = header->checkMagic();
+  size_t nodeSize = 0;
+  switch(format) {
+  case NodeFormat::P8L8:   nodeSize = sizeof(Node8x8);   break;
+  case NodeFormat::P8L16:  nodeSize = sizeof(Node8x16);  break;
+  case NodeFormat::P16L8:  nodeSize = sizeof(Node16x8);  break;
+  case NodeFormat::P16L16: nodeSize = sizeof(Node16x16); break;
+  }
+  
+  size_t tableByteSize = header->tableNodeCount * nodeSize;
+  auto table = extractTableByFormat(inView.data() + sizeof(Header), header->tableNodeCount, format);
+  inIter += tableByteSize;
 
+  auto outMap = MappedFile(outputFilename, MappedFile::CreationDisposition::CREATE, header->decompressedLength);
+  auto outView = outMap.getView(0, outMap.size());
+
+  auto outIter = outView.begin();
+
+  for(auto& node : table) {
+    auto inTail = inIter + node.prefix;
+    outIter = std::copy(inIter, inTail, outIter);
+    inIter = inTail;
+
+    auto outTail = outIter + node.length;
+    std::fill(outIter, outTail, node.value);
+    outIter = outTail;
+  }
+  
+  outIter = std::copy(inIter, inView.end(), outIter);
+  if(outIter != outView.end()) {
+    throw std::runtime_error("Inflated file does not match expected length.");
+  }
+}
+
+#include <filesystem>
+#include <iostream>
+
+void primaryTest() {
   std::string testfile = "testfile.txt";
-  std::string deflated = "deflated.bin";
-  std::string inflated = "inflated.bin";
+  std::string deflated = testfile + ".rle";
+  std::string inflated = "reinflated.txt";
 
   std::filesystem::remove(deflated);
   std::filesystem::remove(inflated);
 
-  MappedFile map(testfile, MappedFile::CreationDisposition::OPEN);
-  auto data = map.getView(0, map.size());
+  deflateFile(testfile, deflated);
+  inflateFile(deflated, inflated);
 
-  auto runs = collectRuns(data);
-  auto table = parseRuns<RLENode>(runs);
-  writeDeflatedFile<RLENode, PackedRLENode>(data, table, deflated);
-  inflateFile<PackedRLENode>(deflated, inflated);
-
-  MappedFile infMap(inflated, MappedFile::CreationDisposition::OPEN);
-  auto infData = infMap.getView(0, infMap.size());
-  std::cout << "Equality Test: " << (std::equal(infData.begin(), infData.end(), data.begin(), data.end()) ? "Pass" : "Fail") << "\n";
-  MappedFile defMap(deflated, MappedFile::CreationDisposition::OPEN);
-  auto compression = (float)((defMap.size() * 10000) / infMap.size()) / 100;
+  MappedFile testMap(testfile, MappedFile::CreationDisposition::OPEN);
+  auto infData = testMap.getView(0, testMap.size());
+  MappedFile reinfMap(inflated, MappedFile::CreationDisposition::OPEN);
+  auto defData = reinfMap.getView(0, reinfMap.size());
+  std::cout << "Equality Test: " << (std::equal(infData.begin(), infData.end(), defData.begin(), defData.end()) ? "Pass" : "Fail") << "\n";
+  auto deflatedSize = std::filesystem::file_size(std::filesystem::path(deflated));
+  auto compression = (float)((deflatedSize * 10000) / testMap.size()) / 100;
   std::cout << "Compressed Length Percentage: " << compression << "\n";
-  auto bytesSaved = checkTableBytesSaved<RLENode, PackedRLENode>(table);
-  std::cout << "Table bytes saved: " << bytesSaved << "\n";
   std::cout << std::endl;
 
   system("pause");
 
 }
+
+void efficiencyCalcTest() {
+  std::vector<Run> runs;
+  {
+    MappedFile inMap("testfile.txt", MappedFile::CreationDisposition::OPEN);
+    auto inView = inMap.getView(0, inMap.size());
+    runs = collectRuns(inView);
+  }
+
+  auto c11 = calculateFormatEfficiency<Node8x8>(runs);
+  auto c12 = calculateFormatEfficiency<Node8x16>(runs);
+  auto c21 = calculateFormatEfficiency<Node16x8>(runs);
+  auto c22 = calculateFormatEfficiency<Node16x16>(runs);
+
+  std::vector<Node8x8> nodes11;
+  std::vector<Node8x16> nodes12;
+  std::vector<Node16x8> nodes21;
+  std::vector<Node16x16> nodes22;
+
+  for(auto& run : runs) {
+    parseRun(run, nodes11);
+    parseRun(run, nodes12);
+    parseRun(run, nodes21);
+    parseRun(run, nodes22);
+  }
+
+  int64_t m11 = measureEfficiency(nodes11);
+  int64_t m12 = measureEfficiency(nodes12);
+  int64_t m21 = measureEfficiency(nodes21);
+  int64_t m22 = measureEfficiency(nodes22);
+
+  if(c11 != m11) { __debugbreak(); }
+  if(c12 != m12) { __debugbreak(); }
+  if(c21 != m21) { __debugbreak(); }
+  if(c22 != m22) { __debugbreak(); }
+}
+
+#include <Windows.h>
+
+int main() {
+  efficiencyCalcTest();
+  primaryTest();
+}
+
+
+
+
+
+
+
+
