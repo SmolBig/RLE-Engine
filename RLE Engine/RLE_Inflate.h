@@ -81,6 +81,7 @@ void inflateFile(const std::string& inputFilename, const std::string& outputFile
 
   auto outIter = outView.begin();
 
+  //~~@ thread this
   for(auto& node : table) {
     auto inTail = inIter + node.prefix;
     outIter = std::copy(inIter, inTail, outIter);

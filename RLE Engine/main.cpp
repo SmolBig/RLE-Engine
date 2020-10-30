@@ -29,20 +29,24 @@ void primaryTest(const std::string& testfile) {
   std::string deflated = testfile + ".rle";
   std::string inflated = testfile + ".reinflated";
 
+  std::cout << "Purging existing output files.\n";
   std::filesystem::remove(deflated);
   std::filesystem::remove(inflated);
 
+  std::cout << "Deflating...";
   deflateFile(testfile, deflated);
+  std::cout << "\nRe-inflating...";
   inflateFile(deflated, inflated);
 
+  std::cout << "\nDone.\n";
   MappedFile testMap(testfile, MappedFile::CreationDisposition::OPEN);
-  auto infData = testMap.getView(0, testMap.size());
   MappedFile reinfMap(inflated, MappedFile::CreationDisposition::OPEN);
-  auto defData = reinfMap.getView(0, reinfMap.size());
-  std::cout << "Equality Test: " << (std::equal(infData.begin(), infData.end(), defData.begin(), defData.end()) ? "Pass" : "Fail") << "\n";
   auto deflatedSize = std::filesystem::file_size(std::filesystem::path(deflated));
   auto compression = (float)((deflatedSize * 10000) / testMap.size()) / 100;
-  std::cout << "Compressed Length Percentage: " << compression << "\n";
+  std::cout << "\nCompressed Length Percentage: " << compression << "\n";
+  auto infData = testMap.getView(0, testMap.size());
+  auto defData = reinfMap.getView(0, reinfMap.size());
+  std::cout << "Testing Equality: " << (std::equal(infData.begin(), infData.end(), defData.begin(), defData.end()) ? "Pass" : "Fail") << "\n";
   std::cout << std::endl;
 
   system("pause");
@@ -110,9 +114,12 @@ void inflate(int argc, char** argv) {
   std::cout << "\nFinished.\n\n";
 }
 
-int main(int argc, char** argv) {
-//#define BUILD_DEFLATE
+int main(/*int argc, char** argv*/) {
+  primaryTest("testdata.bin");
+  return 0;
 
+//#define BUILD_DEFLATE
+  /*
   try {
 #if defined BUILD_DEFLATE
     deflate(argc, argv);
@@ -124,7 +131,7 @@ int main(int argc, char** argv) {
     std::cout << e.what() << "\n\n";
     system("pause");
   }
-
+  */
 }
 
 

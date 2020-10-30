@@ -2,6 +2,7 @@
 #include "RLE_Shared.h"
 #include <unordered_map>
 #include <vector>
+#include <future>
 
 template <class NodeType>
 void parseRun(const Run& run, std::vector<NodeType>& outVec) {
@@ -119,10 +120,44 @@ std::pair<NodeFormat, int64_t> selectFormat(const std::vector<Run>& runs) {
 }
 
 template <class NodeType>
-RLETable generateRLETable(NodeFormat format, int64_t efficiency, const std::vector<Run>& runs) {
+std::vector<NodeType> parseRunSet(const std::span<const Run>& runs) {
   std::vector<NodeType> nodes;
   nodes.reserve(runs.size());
-  for(auto& run : runs) { parseRun(run, nodes); }
+  for(auto& run : runs) {
+    parseRun(run, nodes);
+  }
+  return nodes;
+}
+
+template <class NodeType>
+RLETable generateRLETable(NodeFormat format, int64_t efficiency, const std::vector<Run>& runs) {
+  constexpr size_t RUNS_PER_THREAD = 0x80000;
+  size_t threadCount = runs.size() / RUNS_PER_THREAD;
+  size_t runsDist = runs.size() / threadCount;
+
+  std::vector<std::span<const Run>> runBlocks;
+  runBlocks.reserve(threadCount);
+  auto runsIter = runs.begin();
+  //note that loop starts at 1 instead of zero, so that one block is not handled by the loop
+  for(int i = 1; i < threadCount; i++) {
+    auto tail = runsIter + runsDist;
+    runBlocks.emplace_back(runsIter, tail);
+    runsIter = tail;
+  }
+  runBlocks.emplace_back(runsIter, runs.end());
+
+  std::vector<std::future<std::vector<NodeType>>> futures;
+  auto policy = std::launch::async;
+  for(auto& block : runBlocks) {
+    futures.push_back(std::async(policy, parseRunSet<NodeType>, block));
+  }
+
+  std::vector<NodeType> nodes;
+  nodes.reserve(runs.size());
+  for(auto& fut : futures) {
+    auto block = fut.get();
+    nodes.insert(nodes.end(), block.begin(), block.end());
+  }
   return RLETable(format, efficiency, nodes);
 }
 
@@ -170,6 +205,7 @@ std::vector<Run> collectRuns(const std::span<std::byte>& data) {
   std::vector<Run> runs;
   runs.reserve(data.size() >> 10);
 
+  //~~@ thread this
   Run run;
   size_t prevTailPos = 0;
   for(size_t i = 0; i < data.size(); ) {
