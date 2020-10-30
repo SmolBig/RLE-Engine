@@ -149,9 +149,12 @@
   <ItemGroup>
     <ClCompile Include="MappedFile.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="RLE_Shared.h" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="MappedFile.h" />
+    <ClInclude Include="RLE_Deflate.h" />
+    <ClInclude Include="RLE_Inflate.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
