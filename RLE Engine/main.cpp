@@ -115,7 +115,7 @@ void inflate(int argc, char** argv) {
 }
 
 int main(/*int argc, char** argv*/) {
-  primaryTest("testdata.bin");
+  primaryTest("testfile.txt");
   return 0;
 
 //#define BUILD_DEFLATE

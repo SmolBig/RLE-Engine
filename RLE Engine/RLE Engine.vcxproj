@@ -149,7 +149,7 @@
   <ItemGroup>
     <ClCompile Include="MappedFile.cpp" />
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="RLE_Shared.h" />
+    <ClInclude Include="RLE_Shared.h" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="MappedFile.h" />

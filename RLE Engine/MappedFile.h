@@ -19,6 +19,8 @@ public:
   // When disposition is CREATE, length must be non-zero.
   // Map length can not be adjusted after creation.
   MappedFile(const std::string& filename, CreationDisposition disposition, uint64_t desiredLength = 0);
+  MappedFile(const MappedFile&) = delete;
+  MappedFile(MappedFile&&);
   ~MappedFile();
 
   // Returns length (in bytes) of file/map.
@@ -39,6 +41,8 @@ public:
   class View : public std::span<std::byte> {
     friend View MappedFile::getView(uint64_t offset, size_t length);
   public:
+    View(const View&) = delete;
+    View(View&&);
     ~View();
 
   private:

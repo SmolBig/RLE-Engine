@@ -131,8 +131,7 @@ std::vector<NodeType> parseRunSet(const std::span<const Run>& runs) {
 
 template <class NodeType>
 RLETable generateRLETable(NodeFormat format, int64_t efficiency, const std::vector<Run>& runs) {
-  constexpr size_t RUNS_PER_THREAD = 0x80000;
-  size_t threadCount = runs.size() / RUNS_PER_THREAD;
+  size_t threadCount = 4; //~~@
   size_t runsDist = runs.size() / threadCount;
 
   std::vector<std::span<const Run>> runBlocks;
@@ -159,10 +158,6 @@ RLETable generateRLETable(NodeFormat format, int64_t efficiency, const std::vect
     nodes.insert(nodes.end(), block.begin(), block.end());
   }
   return RLETable(format, efficiency, nodes);
-}
-
-void reject() {
-  throw std::runtime_error("Cannot deflate this file efficiently. Reject it. (Rejection not yet implemented.)");
 }
 
 template <class NodeType>
@@ -201,11 +196,10 @@ void deflateData(MappedFile::View& inView, MappedFile::View& outView) {
   std::copy(inIter, inView.end(), outIter);
 }
 
-std::vector<Run> collectRuns(const std::span<std::byte>& data) {
+std::vector<Run> collectRuns(const std::span<const std::byte>& data) { //~~@ thread this
   std::vector<Run> runs;
   runs.reserve(data.size() >> 10);
 
-  //~~@ thread this
   Run run;
   size_t prevTailPos = 0;
   for(size_t i = 0; i < data.size(); ) {
@@ -243,9 +237,7 @@ void deflateFile(const std::string& inputFilename, const std::string& outputFile
   case NodeFormat::P8L16:  table = generateRLETable<Node8x16 >(format, efficiency, runs); break;
   case NodeFormat::P16L8:  table = generateRLETable<Node16x8 >(format, efficiency, runs); break;
   case NodeFormat::P16L16: table = generateRLETable<Node16x16>(format, efficiency, runs); break;
-  case NodeFormat::INEFFICIENT:
-    reject();
-    return;
+  case NodeFormat::INEFFICIENT: throw std::runtime_error("Cannot deflate this file efficiently.");
   };
 
   uint64_t compressedLength = inMap.size() - table.efficiency + sizeof(Header);

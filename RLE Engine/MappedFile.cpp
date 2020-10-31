@@ -72,9 +72,19 @@ MappedFile::MappedFile(const std::string& filename, CreationDisposition disposit
   length = size.QuadPart;
 }
 
+MappedFile::MappedFile(MappedFile&& other) :
+  file(other.file),
+  map(other.map),
+  length(other.length)
+{
+  other.file = other.map = nullptr;
+}
+
 MappedFile::~MappedFile() {
-  CloseHandle(map);
-  CloseHandle(file);
+  if(map) {
+    CloseHandle(map);
+    CloseHandle(file);
+  }
 }
 
 MappedFile::View MappedFile::getView(uint64_t offset, size_t viewLength) {
@@ -93,7 +103,7 @@ MappedFile::View MappedFile::getView(uint64_t offset, size_t viewLength) {
 
   LARGE_INTEGER liOffset;
   liOffset.QuadPart = grains * granularity;
-  void* ptr = MapViewOfFile(map, FILE_MAP_WRITE, liOffset.HighPart, liOffset.LowPart, viewLength);
+  void* ptr = MapViewOfFile(map, FILE_MAP_WRITE, liOffset.HighPart, liOffset.LowPart, viewLength + remains);
   if(ptr == nullptr) { throwWindowsError(); }
   return View(reinterpret_cast<std::byte*>(ptr) + remains, viewLength);
 }
@@ -105,7 +115,16 @@ MappedFile::View::View(std::byte* data, size_t length) :
   //nop
 }
 
+MappedFile::View::View(View&& other) :
+  std::span<std::byte>(other.data(), other.size()),
+  ptr(other.ptr)
+{
+  other.ptr = nullptr;
+}
+
 MappedFile::View::~View() {
-  FlushViewOfFile(ptr, 0);
-  UnmapViewOfFile(ptr);
+  if(ptr) {
+    FlushViewOfFile(ptr, 0);
+    UnmapViewOfFile(ptr);
+  }
 }
